@@ -1,0 +1,2451 @@
+---
+title: "AoU Trial Eligibility Final"
+author: "Cathy Shyr"
+date: "2023-06-22"
+output: pdf_document
+---
+
+```{r, Load packages}
+library(bigrquery)
+library(plyr)
+library(tidyverse)
+library(data.table)
+library(httr)
+library(jsonlite)
+library(tidyr)
+library(stringr)
+library(plotly)
+library(MASS)
+library(Hmisc)
+library(splitstackshape)
+library(doMC)
+library(foreach)
+library(doParallel)
+library(dplyr)
+library(PheWAS)
+```
+
+```{r}
+# the current workspace's dataset variable (to use in the query)
+dataset = Sys.getenv('WORKSPACE_CDR')
+
+# helper function to make the download easier
+download_data <- function(query) {
+   tb <- bq_project_query(Sys.getenv('GOOGLE_PROJECT'), query)
+   bq_table_download(tb)
+}
+```
+
+```{r}
+# Extract observations that have at least 2 entries of a given EHR condition
+person_condition_query <- str_glue("SELECT 
+                                        person.person_id,
+                                        person.sex_at_birth_concept_id, 
+                                        person.birth_datetime as date_of_birth,
+                                        person.race_concept_id,
+                                        person.ethnicity_concept_id,
+                                        condition_occurrence.condition_concept_id,
+                                        condition_occurrence.condition_source_value,
+                                        observation.value_as_string,
+                                        concept.concept_code,
+                                        concept.concept_name
+                                    FROM
+                                        `{dataset}.person` person
+                                    JOIN
+                                        `{dataset}.condition_occurrence` condition_occurrence
+                                    ON 
+                                        person.person_id = condition_occurrence.person_id
+                                    JOIN
+                                        `{dataset}.concept` concept
+                                    ON
+                                        condition_occurrence.condition_concept_id = concept.concept_id
+                                    LEFT JOIN
+                                        `{dataset}.observation` observation
+                                    ON
+                                        person.person_id = observation.person_id
+                                    WHERE
+                                        observation.observation_source_concept_id = 1585250
+                                    QUALIFY ROW_NUMBER() OVER(PARTITION BY condition_occurrence.person_id, condition_occurrence.condition_concept_id
+                                                              ORDER     BY condition_occurrence.condition_concept_id) = 2")
+
+person_condition_df <- download_data(person_condition_query)
+person_condition_df$age_in_years <- (as.Date("2023-02-14")-as.Date(person_condition_df$date_of_birth))/365
+person_condition_df$age_in_years <- as.numeric(gsub(" days", "", person_condition_df$age_in_years))
+person_condition_df <- as.data.table(person_condition_df)
+write.csv(person_condition_df, file = "person_condition_df.csv")
+
+# sex_at_birth_concept_id
+# 45878463 - Female
+# 45880669 - Male
+# 1177221 - Prefer not to answer
+# 46273637 - Intersex
+# 4124462 - None
+
+# race_concept_id
+# 38003615 - Middle Eastern or North African
+# 8557 - Native Hawaiian or Other Pacific Islander
+# 2100000001 - None indicated
+# 2000000008 - Multiple selections of above; 
+# 8515 - Asian
+# 8516 - Black or African American
+# 8527 - White
+# 1177221 - Prefer not to answer
+# 903096 - Skip; 
+# 45882607 - None of these
+
+# ethnicity_concept_id
+# 38003564 - Not Hispanic or Latino
+# 38003563 - Hispanic or Latino
+# 903079 - Prefer not to answer
+# 903096 - Skip
+# 1586148 - None of these
+```
+
+```{r}
+########################################################################################
+#                                                                                      #
+#                                     Map to PheCodes                                  #        
+#                                                                                      #
+########################################################################################
+person_condition_df <- fread("person_condition_df.csv", header = TRUE)
+
+# Read in PheCode files
+phecode_icd9 <- as.data.table(fread("phecode_icd9_rolled.csv", header = TRUE))
+phecode_icd10 <- as.data.table(fread("phecode_icd10.csv", header = TRUE))
+phecode_icd10cm <- as.data.table(fread("Phecode_map_v1_2_icd10cm_beta.csv", header = TRUE))
+names(phecode_icd9) <- c("condition_source_value", names(phecode_icd9)[-1])
+names(phecode_icd10) <- c("condition_source_value", names(phecode_icd10)[-1])
+names(phecode_icd10cm) <- c("condition_source_value", "icd10cm_str", "PheCode", "Phenotype", "exclude_range", "exclude_name", "leaf", "rollup")
+
+Phecode_Phenotype <- rbind(phecode_icd9[, c("condition_source_value", "PheCode", "Phenotype")],
+                     phecode_icd10[, c("condition_source_value", "PheCode", "Phenotype")],
+                     phecode_icd10cm[, c("condition_source_value", "PheCode", "Phenotype")])
+Phecode_Phenotype <- Phecode_Phenotype %>% distinct()
+# There are a few where the Phecode exists but the phenotype is empty, so remove those
+Phecode_Phenotype <- Phecode_Phenotype[-which(Phecode_Phenotype$Phenotype %in% ""), ]
+
+Phecode_Map <- rbind(Phecode_Phenotype[, c("condition_source_value", "PheCode")],
+                     Phecode_Phenotype[, c("condition_source_value", "PheCode")],
+                     Phecode_Phenotype[, c("condition_source_value", "PheCode")])
+Phecode_Map <- Phecode_Map %>% distinct()
+
+# Map source concept code to PheCode (direct mapping)
+person_condition_df_phecode <- Phecode_Map[person_condition_df, on = "condition_source_value", allow.cartesian = TRUE]
+person_condition_df_phecode_final <- person_condition_df_phecode %>% distinct()
+# The code below handles cases where non-ICD vocab concepts are mapped to the same OMOP
+# concept as the ICD concept in the data. However, because these are non-ICD vocabs,
+# they were not mapped to Phecodes in the first step. So I will merge on the concept_name
+# in order to map these non-ICD vocabs to Phecodes
+person_condition_df_phecode_final_name_PheCode <- person_condition_df_phecode_final[, c("concept_name", "PheCode")]
+person_condition_df_phecode_final_name_PheCode <- person_condition_df_phecode_final_name_PheCode %>% distinct()
+person_condition_df_phecode_final_name_PheCode <- person_condition_df_phecode_final_name_PheCode[which(!is.na(person_condition_df_phecode_final_name_PheCode$PheCode)), ]
+names(person_condition_df_phecode_final_name_PheCode) <- c("concept_name", "PheCode2")
+person_condition_df_phecode_final2 <- person_condition_df_phecode_final_name_PheCode[person_condition_df_phecode_final, on = "concept_name", allow.cartesian = TRUE]
+person_condition_df_phecode_final2[which(is.na(person_condition_df_phecode_final2$PheCode))]$PheCode <- person_condition_df_phecode_final2[which(is.na(person_condition_df_phecode_final2$PheCode))]$PheCode2
+person_condition_df_phecode_final <- person_condition_df_phecode_final2[, -c("PheCode2")]
+# paste("Total number of non-directly mappable conditions =", length(unique(person_condition_df_phecode_final[which(is.na(person_condition_df_phecode_final$PheCode))]$condition_source_value)))
+# paste("Total number of unique source conditions =", length(unique(person_condition_df_phecode_final$condition_source_value)))
+
+# Concept_ids to map to ICD (indirect mapping)
+need2Map <- unique(person_condition_df_phecode_final[which(is.na(person_condition_df_phecode_final$PheCode)), ]$condition_concept_id)
+# Number of codes that are not ICD
+# length(need2Map)
+need2Map_collapse <- paste0(need2Map, collapse = ',')
+
+# Obtain all of these codes where relationship_id = "Mapped from"
+concept_id_Mapped_from_query <- str_glue("SELECT 
+                                           concept_relationship.concept_id_1,
+                                           concept_relationship.concept_id_2
+                                        FROM
+                                           `{dataset}.concept_relationship` concept_relationship
+                                        WHERE
+                                           concept_relationship.concept_id_1 IN ({need2Map_collapse})
+                                        AND
+                                           concept_relationship.relationship_id = 'Mapped from'")
+concept_id_Mapped_from_dat <- as.data.table(download_data(concept_id_Mapped_from_query))
+
+# Retain the ones that were mapped from ICD9-CM or ICD10-CM
+# Need to break up into 2 parts because string is too long otherwise
+concept_id_Mapped_from_dat_id_part1 <- paste0(concept_id_Mapped_from_dat$concept_id_2[1:floor(nrow(concept_id_Mapped_from_dat)/2)], collapse = ',')
+concept_id_Mapped_from_dat_id_part2 <- paste0(concept_id_Mapped_from_dat$concept_id_2[(floor(nrow(concept_id_Mapped_from_dat)/2) + 1):nrow(concept_id_Mapped_from_dat)], collapse = ',')
+concept_id2_vocab_query_part1 <- str_glue("SELECT 
+                                        concept.concept_id,
+                                        concept.vocabulary_id,
+                                        concept.concept_code
+                                     FROM
+                                        `{dataset}.concept` concept
+                                     WHERE
+                                        concept.concept_id IN ({concept_id_Mapped_from_dat_id_part1})")
+concept_id2_vocab_query_part2 <- str_glue("SELECT 
+                                        concept.concept_id,
+                                        concept.vocabulary_id,
+                                        concept.concept_code
+                                     FROM
+                                        `{dataset}.concept` concept
+                                     WHERE
+                                        concept.concept_id IN ({concept_id_Mapped_from_dat_id_part2})")
+concept_id2_vocab_dat_part1 <- as.data.table(download_data(concept_id2_vocab_query_part1))
+concept_id2_vocab_dat_part2 <- as.data.table(download_data(concept_id2_vocab_query_part2))
+concept_id2_vocab_dat <- rbind(concept_id2_vocab_dat_part1, concept_id2_vocab_dat_part2)
+names(concept_id2_vocab_dat) <- c("concept_id_2", "vocabulary_id", "concept_code")
+concept_id_Mapped_from_dat_vocab <- concept_id2_vocab_dat[concept_id_Mapped_from_dat, on = "concept_id_2"]
+concept_id_Mapped_from_dat_vocab_ICD <- concept_id_Mapped_from_dat_vocab[which(concept_id_Mapped_from_dat_vocab$vocabulary_id %in% c("ICD9CM", "ICD10CM")), ]
+# Map to PheCodes
+names(Phecode_Map) <- c("concept_code", "PheCode")
+concept_id_Mapped_from_dat_vocab_ICD_phecode <- Phecode_Map[concept_id_Mapped_from_dat_vocab_ICD, on = "concept_code"]
+
+
+concept_id_Mapped_from_dat_vocab_ICD_phecode <- concept_id_Mapped_from_dat_vocab_ICD_phecode[-which(is.na(concept_id_Mapped_from_dat_vocab_ICD_phecode$PheCode)), ]
+need2Map_PheCode <- concept_id_Mapped_from_dat_vocab_ICD_phecode[, c("concept_id_1", "PheCode")]
+need2Map_PheCode <- need2Map_PheCode %>% distinct()
+names(need2Map_PheCode) <- c("condition_concept_id", "PheCode_indirect")
+person_condition_df_phecode_final_final <- need2Map_PheCode[person_condition_df_phecode_final, on = "condition_concept_id", allow.cartesian = TRUE]
+
+# Reconcile extraneous cases
+person_condition_df_phecode_final_final_name_PheCode <- person_condition_df_phecode_final_final[, c("concept_name", "PheCode_indirect")]
+person_condition_df_phecode_final_final_name_PheCode <- person_condition_df_phecode_final_final_name_PheCode %>% distinct()
+person_condition_df_phecode_final_final_name_PheCode <- person_condition_df_phecode_final_final_name_PheCode[which(!is.na(person_condition_df_phecode_final_final_name_PheCode$PheCode_indirect)), ]
+names(person_condition_df_phecode_final_final_name_PheCode) <- c("concept_name", "PheCode2")
+person_condition_df_phecode_final_final2 <- person_condition_df_phecode_final_final_name_PheCode[person_condition_df_phecode_final_final, on = "concept_name", allow.cartesian = TRUE]
+person_condition_df_phecode_final_final2[which(is.na(person_condition_df_phecode_final_final2$PheCode_indirect))]$PheCode_indirect <- person_condition_df_phecode_final_final2[which(is.na(person_condition_df_phecode_final_final2$PheCode_indirect))]$PheCode2
+person_condition_df_phecode_final_final <- person_condition_df_phecode_final_final2[, -c("PheCode2")]
+
+# If PheCode is there, default to PheCode, if not, default to PheCode_indirect, if not, default to original concept_code
+person_condition_df_phecode_final_final$Mappable <- "Yes"
+person_condition_df_phecode_final_final$PheCode[which(is.na(person_condition_df_phecode_final_final$PheCode))] <- person_condition_df_phecode_final_final$PheCode_indirect[which(is.na(person_condition_df_phecode_final_final$PheCode))]
+# paste("Total number of non-mappable conditions =", length(unique(person_condition_df_phecode_final_final[which(is.na(person_condition_df_phecode_final_final$PheCode))]$condition_source_value)))
+# Set those that were not mappable to Phecodes to "No" for "Mappable" column
+person_condition_df_phecode_final_final$Mappable[which(is.na(person_condition_df_phecode_final_final$PheCode))] <- "No"
+
+# Add Phenotype to the tables
+Phecode_Phenotype <- rbind(phecode_icd9[, c("PheCode", "Phenotype")],
+                     phecode_icd10[, c("PheCode", "Phenotype")],
+                     phecode_icd10cm[, c("PheCode", "Phenotype")])
+Phecode_Phenotype <- Phecode_Phenotype %>% distinct()
+Phecode_Phenotype <- Phecode_Phenotype[-which(Phecode_Phenotype$Phenotype %in% ""), ]
+# Merge by PheCode
+person_condition_df_phecode_phenotype <- Phecode_Phenotype[person_condition_df_phecode_final_final, on = "PheCode", allow.cartesian = TRUE]
+person_condition_df_phecode_phenotype$Phenotype[which(is.na(person_condition_df_phecode_phenotype$PheCode))] <- person_condition_df_phecode_phenotype$concept_name[which(is.na(person_condition_df_phecode_phenotype$PheCode))]
+person_condition_df_phecode_phenotype$PheCode[which(is.na(person_condition_df_phecode_phenotype$PheCode))] <- person_condition_df_phecode_phenotype$concept_code[which(is.na(person_condition_df_phecode_phenotype$PheCode))]
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, -c("PheCode_indirect")]
+
+# AoU coverage check
+AoU_coverage_check <- person_condition_df_phecode_phenotype[, c("person_id", "concept_code", "Mappable")]
+AoU_coverage_check <- AoU_coverage_check %>% distinct()
+# paste0("Phecode coverage across AoU conditions =", length(which(AoU_coverage_check$Mappable %in% "Yes"))/nrow(AoU_coverage_check))
+
+# Just keep the ones that are mappable to Phecodes
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[which(person_condition_df_phecode_phenotype$Mappable %in% "Yes"), ]
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype %>% distinct()
+write.csv(person_condition_df_phecode_phenotype, file = "person_condition_df_phecode_phenotype.csv")
+```
+
+```{r}
+##############################################################################################
+#                                  CTgov API Loop                                            #
+##############################################################################################
+# Obtain a list of unique AoU conditions
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[which(person_condition_df_phecode_phenotype$Mappable %in% "Yes"), ]
+concept_dat <- person_condition_df_phecode_phenotype[, c("PheCode", "Phenotype")] %>% distinct()
+names(concept_dat) <- c("concept_code", "concept_name")
+concept_dat$concept_name <- tolower(concept_dat$concept_name)
+concept_dat$concept_name_url <- sapply(concept_dat$concept_name, URLencode, USE.NAMES = FALSE)
+
+API_result_list <- vector("list", length = nrow(concept_dat))
+
+# Query each phenotype on CTgov and save the result
+for(x in 1:nrow(concept_dat)){
+  print(x)
+  query_url <- paste0("https://www.clinicaltrials.gov/api/query/study_fields?expr=COVERAGE%5BContains%5D", concept_dat$concept_name_url[x], "+AND+EXPANSION%5BRelaxation%5D", concept_dat$concept_name_url[x], "+AND+SEARCH%5BLocation%5D%28AREA%5BLocationCountry%5DUnited+States+AND+AREA%5BLocationStatus%5DRecruiting%29+&fields=NCTId%2CGender%2CMinimumAge%2CMaximumAge%2CLocationZip%2CLeadSponsorClass%2CLeadSponsorName%2CCollaboratorName%2CCollaboratorClass%2CStudyType&min_rnk=1&max_rnk=1000&fmt=json")
+  search_result <- httr::GET(query_url, config = httr::config(connecttimeout = 60))
+  parsed_result <- fromJSON(rawToChar(search_result$content))
+  numStudy <- parsed_result$StudyFieldsResponse$NStudiesFound
+  if(is.null(numStudy)){
+    API_result_list[[x]] <- data.frame(Index = NA, NCTId = NA, Gender = NA, MinimumAge = NA, MaximumAge = NA, Zip = NA, LeadSponsorClass = NA, LeadSponsorName = NA, CollaboratorName = NA, CollaboratorClass = NA, StudyType = NA, concept_code = concept_dat$concept_code[x])
+  }else{
+    if(numStudy == 0){
+      API_result_list[[x]] <- data.frame(Index = NA, NCTId = NA, Gender = NA, MinimumAge = NA, MaximumAge = NA, Zip = NA, LeadSponsorClass = NA, LeadSponsorName = NA, CollaboratorName = NA, CollaboratorClass = NA, StudyType = NA, concept_code = concept_dat$concept_code[x])
+    }else{
+      API_result_list[[x]] <- parsed_result$StudyFieldsResponse$StudyFields
+      names(API_result_list[[x]]) <- c("Index", "NCTId", "Gender", "MinimumAge", "MaximumAge", "Zip", "LeadSponsorClass", "LeadSponsorName", "CollaboratorName", "CollaboratorClass", "StudyType")
+      API_result_list[[x]]$concept_code <- concept_dat$concept_code[x]
+    }
+    # Search up to 5000 records if needed
+    if(numStudy > 1000){
+      query_url <- paste0("https://www.clinicaltrials.gov/api/query/study_fields?expr=COVERAGE%5BContains%5D", concept_dat$concept_name_url[x], "+AND+EXPANSION%5BRelaxation%5D", concept_dat$concept_name_url[x], "+AND+SEARCH%5BLocation%5D%28AREA%5BLocationCountry%5DUnited+States+AND+AREA%5BLocationStatus%5DRecruiting%29+&fields=NCTId%2CGender%2CMinimumAge%2CMaximumAge%2CLocationZip%2CLeadSponsorClass%2CLeadSponsorName%2CCollaboratorName%2CCollaboratorClass%2CStudyType&min_rnk=1001&max_rnk=2000&fmt=json")
+      search_result <- httr::GET(query_url, config = httr::config(connecttimeout = 60))
+      parsed_result <- fromJSON(rawToChar(search_result$content))
+      tmp <- parsed_result$StudyFieldsResponse$StudyFields
+      tmp$concept_code <- concept_dat$concept_code[x]
+      names(tmp) <- colnames(API_result_list[[x]])
+      API_result_list[[x]] <- rbind(API_result_list[[x]], tmp)
+      if(numStudy > 2000){
+        query_url <- paste0("https://www.clinicaltrials.gov/api/query/study_fields?expr=COVERAGE%5BContains%5D", concept_dat$concept_name_url[x], "+AND+EXPANSION%5BRelaxation%5D", concept_dat$concept_name_url[x], "+AND+SEARCH%5BLocation%5D%28AREA%5BLocationCountry%5DUnited+States+AND+AREA%5BLocationStatus%5DRecruiting%29+&fields=NCTId%2CGender%2CMinimumAge%2CMaximumAge%2CLocationZip%2CLeadSponsorClass%2CLeadSponsorName%2CCollaboratorName%2CCollaboratorClass%2CStudyType&min_rnk=2001&max_rnk=3000&fmt=json")
+        search_result <- httr::GET(query_url, config = httr::config(connecttimeout = 60))
+        parsed_result <- fromJSON(rawToChar(search_result$content))
+        tmp <- parsed_result$StudyFieldsResponse$StudyFields
+        tmp$concept_code <- concept_dat$concept_code[x]
+        names(tmp) <- colnames(API_result_list[[x]])
+        API_result_list[[x]] <- rbind(API_result_list[[x]], tmp)
+        if(numStudy > 3000){
+          query_url <- paste0("https://www.clinicaltrials.gov/api/query/study_fields?expr=COVERAGE%5BContains%5D", concept_dat$concept_name_url[x], "+AND+EXPANSION%5BRelaxation%5D", concept_dat$concept_name_url[x], "+AND+SEARCH%5BLocation%5D%28AREA%5BLocationCountry%5DUnited+States+AND+AREA%5BLocationStatus%5DRecruiting%29+&fields=NCTId%2CGender%2CMinimumAge%2CMaximumAge%2CLocationZip%2CLeadSponsorClass%2CLeadSponsorName%2CCollaboratorName%2CCollaboratorClass%2CStudyType&min_rnk=3001&max_rnk=4000&fmt=json")
+          search_result <- httr::GET(query_url, config = httr::config(connecttimeout = 60))
+          parsed_result <- fromJSON(rawToChar(search_result$content))
+          tmp <- parsed_result$StudyFieldsResponse$StudyFields
+          tmp$concept_code <- concept_dat$concept_code[x]
+          names(tmp) <- colnames(API_result_list[[x]])
+          API_result_list[[x]] <- rbind(API_result_list[[x]], tmp)
+          if(numStudy > 4000){
+            query_url <- paste0("https://www.clinicaltrials.gov/api/query/study_fields?expr=COVERAGE%5BContains%5D", concept_dat$concept_name_url[x], "+AND+EXPANSION%5BRelaxation%5D", concept_dat$concept_name_url[x], "+AND+SEARCH%5BLocation%5D%28AREA%5BLocationCountry%5DUnited+States+AND+AREA%5BLocationStatus%5DRecruiting%29+&fields=NCTId%2CGender%2CMinimumAge%2CMaximumAge%2CLocationZip%2CLeadSponsorClass%2CLeadSponsorName%2CCollaboratorName%2CCollaboratorClass%2CStudyType&min_rnk=4001&max_rnk=5000&fmt=json")
+            search_result <- httr::GET(query_url, config = httr::config(connecttimeout = 60))
+            parsed_result <- fromJSON(rawToChar(search_result$content))
+            tmp <- parsed_result$StudyFieldsResponse$StudyFields
+            tmp$concept_code <- concept_dat$concept_code[x]
+            names(tmp) <- colnames(API_result_list[[x]])
+            API_result_list[[x]] <- rbind(API_result_list[[x]], tmp)
+          }
+        }
+      }
+    }
+  }
+  API_result <- API_result_list[[x]]
+  save(API_result, file = paste0("API_result", x, ".RDa"))
+}
+
+API_result_dat <- data.frame(NCTId = c(), Gender = c(), MinimumAge = c(), MaximumAge = c(), Zip = c(), LeadSponsorClass = c(), LeadSponsorName = c(), CollaboratorName = c(), CollaboratorClass = c(), StudyType = c(), concept_code = c())
+for(i in 1:nrow(concept_dat)){
+  print(i)
+  load(paste0("API_result", i, ".RDa"))
+  API_result_dat <- rbind(API_result_dat, API_result[, -1])
+}
+trial_dat <- apply(API_result_dat, 2, as.character)
+
+# Aside
+trial_dat <- fread("API_result_dat_phecode.csv", header = TRUE)
+names(trial_dat)[which(names(trial_dat) %in% "concept_code")] <- "Phecode"
+# write.csv(trial_dat, file = "trial_dat.csv")
+
+##############################################################################################
+#                                    Post-processing                                         #
+##############################################################################################
+# trial_dat <- fread("trial_dat.csv", header = TRUE)
+# Convert age to years
+minutes_min_ind <- grep("Minutes", trial_dat$MinimumAge)
+minutes_min_ind <- c(minutes_min_ind, grep("Minute", trial_dat$MinimumAge))
+
+hours_min_ind <- grep("Hours", trial_dat$MinimumAge)
+hours_min_ind <- c(hours_min_ind, grep("Hour", trial_dat$MinimumAge))
+
+days_min_ind <- grep("Days", trial_dat$MinimumAge)
+days_min_ind <- c(days_min_ind, grep("Day", trial_dat$MinimumAge))
+
+weeks_min_ind <- grep("Weeks", trial_dat$MinimumAge)
+weeks_min_ind <- c(weeks_min_ind, grep("Week", trial_dat$MinimumAge))
+
+months_min_ind <- grep("Months", trial_dat$MinimumAge)
+months_min_ind <- c(months_min_ind, grep("Month", trial_dat$MinimumAge))
+
+years_min_ind <- grep("Years", trial_dat$MinimumAge)
+years_min_ind <- c(years_min_ind, grep("Year", trial_dat$MinimumAge))
+
+NA_min_ind <- which(is.na(trial_dat$MinimumAge))
+NA_min_ind <- c(NA_min_ind, grep("N/A", trial_dat$MinimumAge))
+NA_min_ind <- c(NA_min_ind, grep("NA", trial_dat$MinimumAge))
+character0_min_ind <- which(trial_dat$MinimumAge %in% "character(0)")
+list_min_ind <- which(trial_dat$MinimumAge %in% "list()")
+
+minutes_max_ind <- grep("Minutes", trial_dat$MaximumAge)
+minutes_max_ind <- c(minutes_max_ind, grep("Minute", trial_dat$MaximumAge))
+
+hours_max_ind <- grep("Hours", trial_dat$MaximumAge)
+hours_max_ind <- c(hours_max_ind, grep("Hour", trial_dat$MaximumAge))
+
+days_max_ind <- grep("Days", trial_dat$MaximumAge)
+days_max_ind <- c(days_max_ind, grep("Day", trial_dat$MaximumAge))
+
+weeks_max_ind <- grep("Weeks", trial_dat$MaximumAge)
+weeks_max_ind <- c(weeks_max_ind, grep("Week", trial_dat$MaximumAge))
+
+months_max_ind <- grep("Months", trial_dat$MaximumAge)
+months_max_ind <- c(months_max_ind, grep("Month", trial_dat$MaximumAge))
+
+years_max_ind <- grep("Years", trial_dat$MaximumAge)
+years_max_ind <- c(years_max_ind, grep("Year", trial_dat$MaximumAge))
+
+NA_max_ind <- which(is.na(trial_dat$MaximumAge))
+NA_max_ind <- c(NA_max_ind, grep("N/A", trial_dat$MaximumAge))
+NA_max_ind <- c(NA_max_ind, grep("NA", trial_dat$MaximumAge))
+character0_max_ind <- which(trial_dat$MaximumAge %in% "character(0)")
+list_max_ind <- which(trial_dat$MaximumAge %in% "list()")
+regexp <- "[[:digit:]]+"
+
+trial_dat$MinimumAge[minutes_min_ind] <- as.numeric(str_extract(trial_dat$MinimumAge[minutes_min_ind], regexp))/(365 * 24 * 60)
+trial_dat$MaximumAge[minutes_max_ind] <- as.numeric(str_extract(trial_dat$MaximumAge[minutes_max_ind], regexp))/(365 * 24 * 60)
+
+trial_dat$MinimumAge[hours_min_ind] <- as.numeric(str_extract(trial_dat$MinimumAge[hours_min_ind], regexp))/(365 * 24)
+trial_dat$MaximumAge[hours_max_ind] <- as.numeric(str_extract(trial_dat$MaximumAge[hours_max_ind], regexp))/(365 * 24)
+
+trial_dat$MinimumAge[days_min_ind] <- as.numeric(str_extract(trial_dat$MinimumAge[days_min_ind], regexp))/365
+trial_dat$MaximumAge[days_max_ind] <- as.numeric(str_extract(trial_dat$MaximumAge[days_max_ind], regexp))/365
+
+trial_dat$MinimumAge[weeks_min_ind] <- as.numeric(str_extract(trial_dat$MinimumAge[weeks_min_ind], regexp))/52
+trial_dat$MaximumAge[weeks_max_ind] <- as.numeric(str_extract(trial_dat$MaximumAge[weeks_max_ind], regexp))/52
+
+trial_dat$MinimumAge[months_min_ind] <- as.numeric(str_extract(trial_dat$MinimumAge[months_min_ind], regexp))/12
+trial_dat$MaximumAge[months_max_ind] <- as.numeric(str_extract(trial_dat$MaximumAge[months_max_ind], regexp))/12
+
+trial_dat$MinimumAge[years_min_ind] <- as.numeric(str_extract(trial_dat$MinimumAge[years_min_ind], regexp))
+trial_dat$MaximumAge[years_max_ind] <- as.numeric(str_extract(trial_dat$MaximumAge[years_max_ind], regexp))
+
+trial_dat$MinimumAge[NA_min_ind] <- 0
+trial_dat$MaximumAge[NA_max_ind] <- 100
+trial_dat$MinimumAge[character0_min_ind] <- 0
+trial_dat$MaximumAge[character0_max_ind] <- 100
+trial_dat$MinimumAge[list_min_ind] <- 0
+trial_dat$MaximumAge[list_max_ind] <- 100
+
+trial_dat$MinimumAge <- as.numeric(trial_dat$MinimumAge)
+trial_dat$MaximumAge <- as.numeric(trial_dat$MaximumAge)
+
+# Exclude pediatric trials/studies
+trial_dat <- trial_dat %>% dplyr::filter(MinimumAge >= 18)
+write.csv(trial_dat, file = "trial_dat.csv")
+
+###################################
+#     Expand on gender and zip    #
+###################################
+trial_dat <- fread("trial_dat.csv", header = TRUE)
+if(length(which(is.na(trial_dat$NCTId))) >= 1){
+  trial_dat <- trial_dat[-which(is.na(trial_dat$NCTId)), ]
+}
+trial_dat <- trial_dat[, c("NCTId", "Gender", "MinimumAge", "MaximumAge", "Zip", "Phecode", "StudyType")]
+
+# Expand based on zip
+trial_dat_expanded_zip <- trial_dat %>% 
+  mutate(
+    Zip = str_replace(Zip, '",', '";'),
+    Zip = str_replace_all(Zip, '^c|(?![.,; ])\\W', '')) %>%
+  separate_rows(Zip, sep = '; ') %>% separate_rows(Zip, sep = ", ") %>% distinct()
+
+# Restrict to centers that have valid 5-digit zipcode
+# Pad the 4 digit zip codes with a leading 0 (R has a tendency to remove the first 0)
+trial_dat_expanded_zip$Zip <- str_pad(trial_dat_expanded_zip$Zip, 5, pad = "0")
+trial_dat_expanded_zip$Zip <- str_extract(trial_dat_expanded_zip$Zip, "\\b\\d{5}\\b")
+trial_dat_expanded_zip <- trial_dat_expanded_zip[grepl("^\\d{5}", trial_dat_expanded_zip$Zip), ]
+
+# Restrict to first 3 digits of zip code
+trial_dat_expanded_zip$Zip <- substr(trial_dat_expanded_zip$Zip, 1, 3)
+trial_dat_expanded_zip <- trial_dat_expanded_zip %>% distinct()
+
+# Expand based on gender
+trial_dat_expanded_zip$Gender <- ifelse(trial_dat_expanded_zip$Gender %in% "Female", "45878463",
+                                        ifelse(trial_dat_expanded_zip$Gender %in% "Male", "45880669",
+                                               ifelse(trial_dat_expanded_zip$Gender %in% "All",
+                                                      "45878463,45880669,9999999999", NA)))
+trial_dat_expanded_zip <- trial_dat_expanded_zip %>% tidyr::separate_rows(Gender)
+write.csv(trial_dat_expanded_zip, file = "trial_dat_expanded_zip.csv")
+
+##############################################################
+#           Create an expanded file without zip              #
+##############################################################
+trial_dat_expanded <- trial_dat_expanded_zip[, -which(names(trial_dat_expanded_zip) %in% "Zip")]
+trial_dat_expanded <- trial_dat_expanded %>% distinct()
+write.csv(trial_dat_expanded, file = "trial_dat_expanded.csv")
+
+##############################################################
+#           Obtain sponsored studies' NCTIds                 #
+##############################################################
+trial_dat <- fread("trial_dat.csv", header = TRUE)
+if(length(which(is.na(trial_dat$NCTId))) >= 1){
+  trial_dat <- trial_dat[-which(is.na(trial_dat$NCTId)), ]
+}
+trial_dat <- trial_dat[, c("NCTId", "LeadSponsorClass")]
+
+trial_dat_expanded <- trial_dat
+NIH_NCTId <- unique(trial_dat_expanded$NCTId[which(trial_dat_expanded$LeadSponsorClass %in% c("NIH"))])
+IND_NCTId <- unique(trial_dat_expanded$NCTId[which(trial_dat_expanded$LeadSponsorClass %in% c("INDUSTRY"))])
+OTH_NCTId <- unique(trial_dat_expanded$NCTId[which(trial_dat_expanded$LeadSponsorClass %in% c("OTHER"))])
+
+##############################################################
+#        Subset expanded datasets to NIH studies             #
+##############################################################
+trial_dat_expanded <- fread("trial_dat_expanded.csv", header = TRUE)
+trial_dat_expanded_zip <- fread("trial_dat_expanded_zip.csv", header = TRUE)
+trial_dat_expanded_NIH <- trial_dat_expanded[which(trial_dat_expanded$NCTId %in% NIH_NCTId), ]
+trial_dat_expanded_zip_NIH <- trial_dat_expanded_zip[which(trial_dat_expanded_zip$NCTId %in% NIH_NCTId), ]
+write.csv(trial_dat_expanded_NIH, file = "trial_dat_expanded_NIH.csv")
+write.csv(trial_dat_expanded_zip_NIH, file = "trial_dat_expanded_zip_NIH.csv")
+
+##############################################################
+#        Subset expanded datasets to industry studies        #
+##############################################################
+trial_dat_expanded_IND <- trial_dat_expanded[which(trial_dat_expanded$NCTId %in% IND_NCTId), ]
+trial_dat_expanded_zip_IND <- trial_dat_expanded_zip[which(trial_dat_expanded_zip$NCTId %in% IND_NCTId), ]
+write.csv(trial_dat_expanded_IND, file = "trial_dat_expanded_IND.csv")
+write.csv(trial_dat_expanded_zip_IND, file = "trial_dat_expanded_zip_IND.csv")
+
+
+##############################################################
+#        Subset expanded datasets to academic studies        #
+##############################################################
+trial_dat_expanded_OTH <- trial_dat_expanded[which(trial_dat_expanded$NCTId %in% OTH_NCTId), ]
+trial_dat_expanded_zip_OTH <- trial_dat_expanded_zip[which(trial_dat_expanded_zip$NCTId %in% OTH_NCTId), ]
+write.csv(trial_dat_expanded_OTH, file = "trial_dat_expanded_OTH.csv")
+write.csv(trial_dat_expanded_zip_OTH, file = "trial_dat_expanded_zip_OTH.csv")
+```
+
+```{r}
+####################################################################################################
+#                              Match Based on Age and Sex For Trials Only                          #
+####################################################################################################
+##############################################################################################
+#                                     Read in Data                                           #
+##############################################################################################
+# AoU data
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode")
+
+# Code sex as male, female, or other to match with CTgov 
+person_condition_df_phecode_phenotype$sex_at_birth_concept_id[which(!(person_condition_df_phecode_phenotype$sex_at_birth_concept_id %in% c(45880669, 45878463)))] <- 9999999999
+# alloc.col(person_condition_df)
+
+# CTgov data
+# Even though this is matching without zip, just use the set where trials have at least 1 valid U.S.-based location
+trial_dat_expanded <- as.data.table(fread("trial_dat_expanded.csv", header = TRUE))
+trial_dat_expanded <- trial_dat_expanded[, -1]
+trial_dat_expanded <- trial_dat_expanded[which(trial_dat_expanded$StudyType %in% "Interventional"), ]
+trial_dat_expanded <- trial_dat_expanded[, c("StudyType"):= NULL]
+trial_dat_expanded$MinimumAge <- as.double(trial_dat_expanded$MinimumAge)
+trial_dat_expanded$Gender <- as.double(trial_dat_expanded$Gender)
+names(trial_dat_expanded) <- c("NCTId", "sex_at_birth_concept_id", "MinimumAge", "MaximumAge", "Phecode")
+
+
+####################################################################################################
+#                              Match Based on Age and Sex                                          #
+####################################################################################################
+# For each participant, count the number of studies s/he is eligible for
+AoU_to_CTgov_Trial <- trial_dat_expanded[person_condition_df_phecode_phenotype, on = c("Phecode", "sex_at_birth_concept_id", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_Trial$person_id <- person_condition_df_phecode_phenotype$person_id
+AoU_to_CTgov_Trial_ReturnOfValue <- AoU_to_CTgov_Trial
+AoU_to_CTgov_Trial_ReturnOfValue <- AoU_to_CTgov_Trial_ReturnOfValue[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_Trial <- AoU_to_CTgov_Trial[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_Trial, file = "AoU_to_CTgov_Trial.csv")
+AoU_to_CTgov_Trial <- AoU_to_CTgov_Trial[order(AoU_to_CTgov_Trial$nMatch, decreasing = TRUE), ]
+# barplot(AoU_to_CTgov_Trial$nMatch, xlab = "Participant", ylab = "Number of Eligible Trials", main = "Number of Eligible Trials by Participant", ylim = c(0, 20000))
+AoU_to_CTgov_Trial$category <- ifelse(AoU_to_CTgov_Trial$nMatch == 0, 0, 
+                                         ifelse(AoU_to_CTgov_Trial$nMatch <= 500, 1, 
+                                                ifelse(AoU_to_CTgov_Trial$nMatch <= 1000, 2, 3)))
+
+# table(AoU_to_CTgov_Trial$category)
+
+# For each trial, count the number of eligible participants
+CTgov_to_AoU_Trial <- person_condition_df_phecode_phenotype[trial_dat_expanded, on = c("Phecode", "sex_at_birth_concept_id", "age_in_years <= MaximumAge", "age_in_years >= MinimumAge"), .(list(person_id)), by = .EACHI]
+CTgov_to_AoU_Trial$NCTId <- trial_dat_expanded$NCTId
+CTgov_to_AoU_Trial_ReturnOfValue <- CTgov_to_AoU_Trial
+CTgov_to_AoU_Trial_ReturnOfValue <- CTgov_to_AoU_Trial_ReturnOfValue[, c("NCTId", "V1", "Phecode")]
+CTgov_to_AoU_Trial <- CTgov_to_AoU_Trial[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(NCTId)]
+write.csv(CTgov_to_AoU_Trial, file = "CTgov_to_AoU_Trial.csv")
+CTgov_to_AoU_Trial <- CTgov_to_AoU_Trial[order(CTgov_to_AoU_Trial$nMatch, decreasing = TRUE), ]
+# barplot(CTgov_to_AoU_Trial$nMatch, xlab = "Study", ylab = "Number of Eligible Participants", main = "Number of Eligible Participants by Trial", ylim = c(0, 200000))
+CTgov_to_AoU_Trial$category <- ifelse(CTgov_to_AoU_Trial$nMatch == 0, 0, 
+                                ifelse(CTgov_to_AoU_Trial$nMatch <= 500, 1, 
+                                       ifelse(CTgov_to_AoU_Trial$nMatch <= 1000, 2, 3)))
+# table(CTgov_to_AoU_Trial$category)
+```
+
+```{r}
+####################################################################################################
+#                              Match Based on Age, Sex and Zip For Trials Only                     #
+####################################################################################################
+##############################################################################################
+#                                     Read in Data                                           #
+##############################################################################################
+# AoU data
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string")
+
+person_condition_df_phecode_phenotype$zip <- sub("^.*([0-9]{3}).*", "\\1", person_condition_df_phecode_phenotype$value_as_string)
+# Remove rows with invalid zip (000)
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[-which(person_condition_df_phecode_phenotype$zip %in% "000"), ]
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
+# Code sex as male, female, or other to match with CTgov 
+person_condition_df_phecode_phenotype$sex_at_birth_concept_id[which(!(person_condition_df_phecode_phenotype$sex_at_birth_concept_id %in% c(45880669, 45878463)))] <- 9999999999
+
+# CTgov data
+trial_dat_expanded_zip <- as.data.table(fread("trial_dat_expanded_zip.csv", header = TRUE))
+trial_dat_expanded_zip <- trial_dat_expanded_zip[, -1]
+trial_dat_expanded_zip <- trial_dat_expanded_zip[which(trial_dat_expanded_zip$StudyType %in% "Interventional"), ]
+trial_dat_expanded_zip <- trial_dat_expanded_zip[, c("StudyType"):= NULL]
+trial_dat_expanded_zip$MinimumAge <- as.double(trial_dat_expanded_zip$MinimumAge)
+trial_dat_expanded_zip$Gender <- as.double(trial_dat_expanded_zip$Gender)
+trial_dat_expanded_zip$Zip <- sprintf("%03d", as.numeric(trial_dat_expanded_zip$Zip))
+names(trial_dat_expanded_zip) <- c("NCTId", "sex_at_birth_concept_id", "MinimumAge", "MaximumAge", "zip", "Phecode")
+
+#########################################################################################################
+#                              Match Based on Age, Sex and Zip                                          #
+#########################################################################################################
+# For each participant, count the number of studies s/he is eligible for
+AoU_to_CTgov_wZip_Trial <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial$person_id <- person_condition_df_phecode_phenotype$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue <- AoU_to_CTgov_wZip_Trial
+AoU_to_CTgov_wZip_Trial_ReturnOfValue <- AoU_to_CTgov_wZip_Trial_ReturnOfValue[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial <- AoU_to_CTgov_wZip_Trial[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial, file = "AoU_to_CTgov_wZip_Trial.csv")
+AoU_to_CTgov_wZip_Trial <- AoU_to_CTgov_wZip_Trial[order(AoU_to_CTgov_wZip_Trial$nMatch, decreasing = TRUE), ]
+#barplot(AoU_to_CTgov_wZip_Trial$nMatch, xlab = "Participant", ylab = "Number of Eligible Trials", main = "Number of Eligible Trials by Participant", ylim = c(0, 2000))
+AoU_to_CTgov_wZip_Trial$category <- ifelse(AoU_to_CTgov_wZip_Trial$nMatch == 0, 0, 
+                                ifelse(AoU_to_CTgov_wZip_Trial$nMatch <= 500, 1, 
+                                       ifelse(AoU_to_CTgov_wZip_Trial$nMatch <= 1000, 2, 3)))
+
+# table(AoU_to_CTgov_wZip_Trial$category)
+
+# For each study, count the number of eligible studies
+CTgov_to_AoU_wZip_Trial <- person_condition_df_phecode_phenotype[trial_dat_expanded_zip, on = c("Phecode", "sex_at_birth_concept_id", "zip", "age_in_years <= MaximumAge", "age_in_years >= MinimumAge"), .(list(person_id)), by = .EACHI]
+CTgov_to_AoU_wZip_Trial$NCTId <- trial_dat_expanded_zip$NCTId
+CTgov_to_AoU_wZip_Trial_ReturnOfValue <- CTgov_to_AoU_wZip_Trial
+CTgov_to_AoU_wZip_Trial_ReturnOfValue <- CTgov_to_AoU_wZip_Trial_ReturnOfValue[, c("NCTId", "V1", "Phecode")]
+CTgov_to_AoU_wZip_Trial <- CTgov_to_AoU_wZip_Trial[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(NCTId)]
+write.csv(CTgov_to_AoU_wZip_Trial, file = "CTgov_to_AoU_wZip_Trial.csv")
+CTgov_to_AoU_wZip_Trial <- CTgov_to_AoU_wZip_Trial[order(CTgov_to_AoU_wZip_Trial$nMatch, decreasing = TRUE), ]
+# barplot(CTgov_to_AoU_wZip_Trial$nMatch, xlab = "Trial", ylab = "Number of Eligible Participants", main = "Number of Eligible Participants by Trial", ylim = c(0, 200000))
+CTgov_to_AoU_wZip_Trial$category <- ifelse(CTgov_to_AoU_wZip_Trial$nMatch == 0, 0, 
+                                ifelse(CTgov_to_AoU_wZip_Trial$nMatch <= 500, 1, 
+                                       ifelse(CTgov_to_AoU_wZip_Trial$nMatch <= 1000, 2, 3)))
+# table(CTgov_to_AoU_wZip_Trial$category)
+```
+
+
+```{r}
+################################################################################################
+#                                 Figure 1.1 and 1.2  (Trials Only: No Zip vs. Zip)            #
+################################################################################################
+AoU_to_CTgov_wZip_Trial <- fread("AoU_to_CTgov_wZip_Trial.csv", header = TRUE)
+AoU_to_CTgov_Trial <- fread("AoU_to_CTgov_Trial.csv", header = TRUE)
+AoU_to_CTgov_wAndwo_Zip_Trial <- AoU_to_CTgov_wZip_Trial[AoU_to_CTgov_Trial, on = "person_id"]
+AoU_to_CTgov_wAndwo_Zip_Trial$nMatch <- ifelse(is.na(AoU_to_CTgov_wAndwo_Zip_Trial$nMatch), 0, AoU_to_CTgov_wAndwo_Zip_Trial$nMatch)
+AoU_to_CTgov_wAndwo_Zip_Trial$i.nMatch <- ifelse(is.na(AoU_to_CTgov_wAndwo_Zip_Trial$i.nMatch), 0, AoU_to_CTgov_wAndwo_Zip_Trial$i.nMatch)
+AoU_to_CTgov_wAndwo_Zip_Trial <- AoU_to_CTgov_wAndwo_Zip_Trial[order(AoU_to_CTgov_wAndwo_Zip_Trial$i.nMatch, decreasing = TRUE), ]
+barplot(AoU_to_CTgov_wAndwo_Zip_Trial$i.nMatch, xlab = "Participant", ylab = "Number of Eligible Trials", main = "Number of Eligible Trials by Participant", ylim = c(0, 13000), col = "#282560", border = "#282560")
+barplot(AoU_to_CTgov_wAndwo_Zip_Trial$nMatch, add = TRUE, col = "#5eaee0", border = "#5eaee0")
+
+# CTgov_to_AoU_wAndwo_Zip <- CTgov_to_AoU_wZip[CTgov_to_AoU, on = "NCTId"]
+# head(CTgov_to_AoU_wAndwo_Zip)
+
+CTgov_to_AoU_wZip_Trial <- fread("CTgov_to_AoU_wZip_Trial.csv", header = TRUE)
+CTgov_to_AoU_Trial <- fread("CTgov_to_AoU_Trial.csv", header = TRUE)
+CTgov_to_AoU_wAndwo_Zip_Trial <- CTgov_to_AoU_wZip_Trial[CTgov_to_AoU_Trial, on = "NCTId"]
+CTgov_to_AoU_wAndwo_Zip_Trial$nMatch <- ifelse(is.na(CTgov_to_AoU_wAndwo_Zip_Trial$nMatch), 0, CTgov_to_AoU_wAndwo_Zip_Trial$nMatch)
+CTgov_to_AoU_wAndwo_Zip_Trial$i.nMatch <- ifelse(is.na(CTgov_to_AoU_wAndwo_Zip_Trial$i.nMatch), 0, CTgov_to_AoU_wAndwo_Zip_Trial$i.nMatch)
+CTgov_to_AoU_wAndwo_Zip_Trial <- CTgov_to_AoU_wAndwo_Zip_Trial[order(CTgov_to_AoU_wAndwo_Zip_Trial$i.nMatch, decreasing = TRUE), ]
+barplot(CTgov_to_AoU_wAndwo_Zip_Trial$i.nMatch, xlab = "Trial", ylab = "Number of Eligible Participants", main = "Number of Eligible Participants by Trial", ylim = c(0, 160000), col = "#282560", border = "#282560")
+barplot(CTgov_to_AoU_wAndwo_Zip_Trial$nMatch, add = TRUE, col = "#5eaee0", border = "#5eaee0")
+```
+
+
+```{r}
+####################################################################################################
+#                                            Table 1                                               #
+####################################################################################################
+##############################################################################################
+#                                 (Add Race/Ethnicity)                                       #
+##############################################################################################
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string", "race_concept_id", "ethnicity_concept_id")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string", "race", "ethnicity")
+
+person_condition_df_phecode_phenotype$zip <- sub("^.*([0-9]{3}).*", "\\1", person_condition_df_phecode_phenotype$value_as_string)
+# Remove rows with invalid zip (000)
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[-which(person_condition_df_phecode_phenotype$zip %in% "000"), ]
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip", "race", "ethnicity")]
+person_condition_df_phecode_phenotype$race_ethnicity <- ifelse(person_condition_df_phecode_phenotype$race == 8527 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "White",
+                                                              ifelse(person_condition_df_phecode_phenotype$race == 8516 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Black",
+                                                                    ifelse(person_condition_df_phecode_phenotype$race == 8515 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Asian",
+                                                                          ifelse(person_condition_df_phecode_phenotype$race == 8557 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "NHOPI",
+                                                                                ifelse(person_condition_df_phecode_phenotype$race == 38003615 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "MENA",
+                                                                                       ifelse(person_condition_df_phecode_phenotype$race == 2000000008 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Multiple",
+                                                                                              ifelse(person_condition_df_phecode_phenotype$ethnicity == 38003563, "Hispanic", "Other")))))))
+person_condition_df_phecode_phenotype$sex_at_birth <- ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id  == 45878463, "Female",
+                                                            ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 45880669, "Male",
+                                                                  ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 903096, "NoAnswer",
+                                                                        ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 0, "NoAnswer",
+                                                                              ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 46273637, "Intersex",
+                                                                                    ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 4124462, "None", "NoAnswer"))))))
+
+##############################################################################################
+#                                    (Add Age Category)                                      #
+##############################################################################################
+person_condition_df_phecode_phenotype$age_cat <- ifelse(person_condition_df_phecode_phenotype$age_in_years < 40, 1,
+                                                        ifelse(person_condition_df_phecode_phenotype$age_in_years < 70, 2, 3))
+person_condition_df_phecode_phenotype$age_cat <- as.factor(person_condition_df_phecode_phenotype$age_cat)
+
+##############################################################################################
+#                                    (Add Location)                                          #
+##############################################################################################
+zip3_wRUCC <-  as.data.table(fread("zip3_wRUCC.csv", header = TRUE))
+zip3_wRUCC <- zip3_wRUCC[, -1]
+zip3_wRUCC$ZIP3 <- str_pad(zip3_wRUCC$ZIP3, 3, pad = "0")
+zip3_wRUCC <- zip3_wRUCC[, c("ZIP3", "wRUCC")]
+names(zip3_wRUCC) <- c("zip", "wRUCC")
+
+# Merge AoU data with zip3-to-RUCC key
+person_condition_df_phecode_phenotype$zip <- as.factor(person_condition_df_phecode_phenotype$zip)
+person_condition_df_phecode_phenotype <- zip3_wRUCC[person_condition_df_phecode_phenotype, on = "zip"]
+person_condition_df_phecode_phenotype$location <- ifelse(person_condition_df_phecode_phenotype$wRUCC < 3, "Metro", "NonMetro")
+person_table1 <- person_condition_df_phecode_phenotype[, c("person_id", "location", "age_cat", "race_ethnicity", "sex_at_birth")]
+person_table1 <- person_table1 %>% distinct()
+
+##############################################################################################
+#                                     (Survey Data)                                          #
+##############################################################################################
+question_id <- c(1585940, 1585386, 903573, 903574, 903575, 903576, 903577, 903578, 1585375, 1585889)
+question_id_collapse <- paste0(question_id, collapse = ",")
+survey_query <- str_glue("SELECT 
+                              answer,
+                              question_concept_id,
+                              person_id,
+                              survey_datetime
+                          FROM 
+                              `{dataset}.ds_survey` ds_survey 
+                          WHERE 
+                              ds_survey.question_concept_id IN ({question_id_collapse})")
+survey_data <- download_data(survey_query)
+survey_data$year <- format(as.Date(survey_data$survey_datetime, format="%d/%m/%Y"),"%Y")
+
+#############
+# Education #
+#############
+# 1585940 What is the highest grade or year of school you completed?
+survey_education <- survey_data[which(survey_data$question_concept_id == 1585940), ]
+survey_education$education <- ifelse(survey_education$answer %in% c("Highest Grade: Never Attended", "Highest Grade: One Through Four", "Highest Grade: Five Through Eight", "Highest Grade: Nine Through Eleven"), "Eleven or below",
+                                    ifelse(survey_education$answer %in% c("Highest Grade: Twelve Or GED", "Highest Grade: College One to Three"), "Twelve or GED", 
+                                           ifelse(survey_education$answer %in% c("Highest Grade: College Graduate"), "College Graduate", 
+                                                 ifelse(survey_education$answer %in% c("Highest Grade: Advanced Degree"), "Advanced Degree", "NoAnswer"))))
+survey_education <- survey_education[, c("person_id", "education")]
+survey_education <- as.data.table(survey_education)
+survey_education <- survey_education %>% distinct()
+
+##############
+# Disability #
+##############
+# 903573 Are you deaf or do you have serious difficulty hearing?
+# 903574 Are you blind or do you have serious difficulty seeing, even when wearing glasses?
+# 903575 Because of a physical, mental, or emotional condition, do you have serious difficulty concentrating, remembering or making decisions?
+# 903576 Do you have serious difficulty walking or climbing stairs?
+# 903577 Do you have difficulty dressing or bathing?
+# 903578 Because of a physical, mental, or emotional condition, do you have difficulty doing errands alone such as visiting doctorвЂ™s office or shopping?
+survey_disability <- survey_data[which(survey_data$question_concept_id %in% c(903573, 903574, 903575, 903576, 903577, 903578)), ]
+survey_disability$disability <- ifelse(survey_disability$answer %in% c("Deaf: Yes", "Blind: Yes", "Errands Alone: Yes",
+                                                                       "Dressing Bathing: Yes", "Walking Climbing: Yes", 
+                                                                       "Difficulty Concentrating: Yes"), "Yes",
+                                      ifelse(survey_disability$answer %in% c("Deaf: No", "Blind: No", "Errands Alone: No",
+                                                                       "Dressing Bathing: No", "Walking Climbing: No", 
+                                                                       "Difficulty Concentrating: No"), "No", "NoAnswer"))
+
+survey_disability <- survey_disability[, c("person_id", "disability")]
+survey_disability <- survey_disability %>% dplyr::group_by(person_id) %>% dplyr::mutate(any_disability = ifelse(any(disability %in% "Yes"), "Yes", disability))
+survey_disability <- survey_disability[, c("person_id", "any_disability")]
+survey_disability <- as.data.table(survey_disability)
+survey_disability <- survey_disability %>% distinct()
+
+##############
+#   Income   #
+##############
+# 1585375 What is your annual household income from all sources?
+# 1585889 Not including yourself, how many other people live at home with you?
+survey_income <- survey_data[which(survey_data$question_concept_id == 1585375), ]
+survey_income <- survey_income[, c("person_id", "answer", "year")]
+survey_income$max_income <- ifelse(survey_income$answer %in% c("Annual Income: 10k 25k"), 25000,
+                                  ifelse(survey_income$answer %in% c("Annual Income: 25k 35k"), 35000,
+                                        ifelse(survey_income$answer %in% c("Annual Income: 35k 50k"), 50000,
+                                              ifelse(survey_income$answer %in% c("Annual Income: 50k 75k"), 75000,
+                                                    ifelse(survey_income$answer %in% c("Annual Income: 75k 100k"), 100000,
+                                                          ifelse(survey_income$answer %in% c("Annual Income: 100k 150k"), 150000,
+                                                                ifelse(survey_income$answer %in% c("Annual Income: 150k 200k"), 200000,
+                                                                      ifelse(survey_income$answer %in% c("Annual Income: more 200k"), 200001,
+                                                                            ifelse(survey_income$answer %in% c("Annual Income: less 10k"), 9999, "NoAnswer")))))))))
+survey_income <- survey_income[, c("person_id", "max_income", "year")]
+survey_income <- as.data.table(survey_income)
+
+survey_size <- survey_data[which(survey_data$question_concept_id == 1585889), ]
+survey_size$family_size <- ifelse(survey_size$answer %in% "0", 1, 
+                                  ifelse(survey_size$answer %in% "1", 2, 
+                                        ifelse(survey_size$answer %in% "2", 3, 
+                                              ifelse(survey_size$answer %in% "3", 4,
+                                                    ifelse(survey_size$answer %in% "4", 5,
+                                                          ifelse(survey_size$answer %in% "5", 6,
+                                                                ifelse(survey_size$answer %in% "6", 7,
+                                                                      ifelse(survey_size$answer %in% "7", 8,
+                                                                            ifelse(survey_size$answer %in% "8", 9,
+                                                                                  ifelse(survey_size$answer %in% "9", 10,
+                                                                                        ifelse(survey_size$answer %in% "10", 11, "NoAnswer")))))))))))
+survey_size <- survey_size[, c("person_id", "family_size")]
+survey_size <- survey_size %>% distinct()
+survey_size <- as.data.table(survey_size)
+person_id_zip <- person_condition_df_phecode_phenotype[, c("person_id", "zip")]
+person_id_zip <- person_id_zip %>% distinct()
+survey_size_zip <- person_id_zip[survey_size, on = "person_id"]
+survey_size_zip_income <- survey_income[survey_size_zip, on = "person_id"]
+
+income_zip_family_size <- fread("income_zip_long_new.csv", header = TRUE)
+income_zip_family_size <- income_zip_family_size[, -1]
+income_zip_family_size$zip <- as.character(income_zip_family_size$zip)
+income_zip_family_size$year <- as.character(income_zip_family_size$year)
+
+survey_size_zip_income_limit <- income_zip_family_size[survey_size_zip_income, on = c("family_size", "zip", "year")]
+survey_size_zip_income_limit <- survey_size_zip_income_limit[-which(survey_size_zip_income_limit$max_income %in% "NoAnswer"), ]
+survey_size_zip_income_limit <- survey_size_zip_income_limit[-which(is.na(survey_size_zip_income_limit$zip)), ]
+survey_size_zip_income_limit$max_income <- as.double(survey_size_zip_income_limit$max_income)
+survey_size_zip_income_limit$low_income <- ifelse(survey_size_zip_income_limit$max_income < survey_size_zip_income_limit$income_limit, "Yes", "No")
+
+survey_low_income <- survey_size_zip_income_limit[, c("person_id", "low_income")]
+survey_low_income <- as.data.table(survey_low_income)
+survey_low_income <- survey_low_income %>% distinct()
+
+# Merge all data together
+person_table1 <- survey_education[person_table1, on = "person_id"]
+person_table1 <- survey_disability[person_table1, on = "person_id"]
+person_table1 <- survey_low_income[person_table1, on = "person_id"]
+person_table1$low_income[which(is.na(person_table1$low_income))] <- "NoAnswer"
+person_table1$any_disability[which(is.na(person_table1$any_disability))] <- "NoAnswer"
+person_table1$education[which(is.na(person_table1$education))] <- "NoAnswer"
+
+# Merge with number of eligible trials
+AoU_to_CTgov_wZip_Trial <- fread("AoU_to_CTgov_wZip_Trial.csv", header = TRUE)
+AoU_to_CTgov_wZip_Trial <- AoU_to_CTgov_wZip_Trial[, -1]
+person_table1 <- AoU_to_CTgov_wZip_Trial[person_table1, on = "person_id"]
+
+# Create table for PheWAS that contains continuous age instead of categorical age
+person_age <- person_condition_df_phecode_phenotype[, c("person_id", "age_in_years")]
+person_PheWAS <- person_age[person_table1, on = "person_id"]
+person_PheWAS <- person_PheWAS %>% distinct()
+person_PheWAS <- person_PheWAS[, c("person_id", "age_in_years", "nMatch", "low_income", "any_disability", "education", "location", "race_ethnicity", "sex_at_birth")]
+write.csv(person_PheWAS, file = "person_PheWAS.csv")
+```
+
+```{r}
+############
+#    Age   #  
+############
+agegroup.kruskal <- kruskal.test(nMatch ~ age_cat, data = person_table1)
+agegroup.kruskal
+ddply(person_table1, c("age_cat"), summarise,
+               N    = length(nMatch),
+               mean = mean(nMatch),
+               sd   = sd(nMatch)
+)
+wilcox.test(person_table1$nMatch[which(person_table1$age_cat == 1)],
+            person_table1$nMatch[which(person_table1$age_cat == 2)], alternative = "less")
+
+wilcox.test(person_table1$nMatch[which(person_table1$age_cat == 1)],
+            person_table1$nMatch[which(person_table1$age_cat == 3)], alternative = "less")
+
+wilcox.test(person_table1$nMatch[which(person_table1$age_cat == 2)],
+            person_table1$nMatch[which(person_table1$age_cat == 3)], alternative = "less")
+
+############
+#    Sex   #  
+############
+
+person_table1_sex <- person_table1[-which(person_table1$sex_at_birth %in% c("None", "NoAnswer")), ]
+sex.kruskal <- kruskal.test(nMatch ~ sex_at_birth, data = person_table1_sex)
+sex.kruskal
+ddply(person_table1_sex, c("sex_at_birth"), summarise,
+               N    = length(nMatch),
+               mean = mean(nMatch),
+               sd   = sd(nMatch)
+)
+
+wilcox.test(person_table1_sex$nMatch[which(person_table1_sex$sex_at_birth %in% "Male")],
+            person_table1_sex$nMatch[which(person_table1_sex$sex_at_birth %in% "Female")], alternative = "less")
+
+############
+#    R/E   #  
+############
+person_table1$race_ethnicity <- as.factor(person_table1$race_ethnicity)
+person_table1_race_ethnicity <- person_table1[-which(person_table1$race_ethnicity %in% "Other"), ]
+RE.kruskal <- kruskal.test(nMatch ~ race_ethnicity, data = person_table1_race_ethnicity)
+RE.kruskal
+ddply(person_table1_race_ethnicity, c("race_ethnicity"), summarise,
+               N    = length(nMatch),
+               mean = mean(nMatch),
+               sd   = sd(nMatch)
+)
+
+wilcox.test(person_table1_race_ethnicity$nMatch[which(person_table1_race_ethnicity$race_ethnicity %in% "Hispanic")],
+            person_table1_race_ethnicity$nMatch[which(person_table1_race_ethnicity$race_ethnicity %in% "Black")], alternative = "less")
+
+# p-value = 9.703e-07
+# Bonf correction
+# 0.05/21 
+################
+#   Location   #  
+################
+person_table1$location <- as.factor(person_table1$location)
+# location.kruskal <- kruskal.test(nMatch ~ location, data = person_table1)
+# location.kruskal
+location.wilcox <- wilcox.test(person_table1$nMatch[which(person_table1$location %in% "NonMetro")],
+            person_table1$nMatch[which(person_table1$location %in% "Metro")], alternative = "less")
+location.wilcox
+ddply(person_table1, c("location"), summarise,
+               N    = length(nMatch),
+               mean = mean(nMatch),
+               sd   = sd(nMatch)
+)
+
+###################
+#    Disability   #  
+###################
+person_table1_disability <- person_table1[-which(person_table1$any_disability %in% "NoAnswer"), ]
+disability.wilcox <- wilcox.test(person_table1_disability$nMatch[person_table1_disability$any_disability %in% "No"], 
+                                 person_table1_disability$nMatch[person_table1_disability$any_disability %in% "Yes"], alternative = "less")
+disability.wilcox
+ddply(person_table1_disability, c("any_disability"), summarise,
+               N    = length(nMatch),
+               mean = mean(nMatch),
+               sd   = sd(nMatch)
+)
+
+
+###################
+#    Education    #  
+###################
+person_table1_edu <- person_table1[-which(person_table1$education %in% "NoAnswer"), ]
+edu.kruskal <- kruskal.test(nMatch ~ education, data = person_table1_edu)
+edu.kruskal
+ddply(person_table1_edu, c("education"), summarise,
+               N    = length(nMatch),
+               mean = mean(nMatch),
+               sd   = sd(nMatch)
+)
+
+wilcox.test(person_table1_edu$nMatch[which(person_table1_edu$education %in% "Advanced Degree")],
+            person_table1_edu$nMatch[which(person_table1_edu$education %in% "Eleven or below")], alternative = "less")
+wilcox.test(person_table1_edu$nMatch[which(person_table1_edu$education %in% "Twelve or GED")],
+            person_table1_edu$nMatch[which(person_table1_edu$education %in% "Eleven or below")], alternative = "less")
+wilcox.test(person_table1_edu$nMatch[which(person_table1_edu$education %in% "College Graduate")],
+            person_table1_edu$nMatch[which(person_table1_edu$education %in% "Eleven or below")], alternative = "less")
+wilcox.test(person_table1_edu$nMatch[which(person_table1_edu$education %in% "Twelve or GED")],
+            person_table1_edu$nMatch[which(person_table1_edu$education %in% "Advanced Degree")], alternative = "less")
+wilcox.test(person_table1_edu$nMatch[which(person_table1_edu$education %in% "College Graduate")],
+            person_table1_edu$nMatch[which(person_table1_edu$education %in% "Advanced Degree")], alternative = "less")
+
+
+
+
+
+################
+#    Income    #  
+################
+person_table1_income <- person_table1[-which(person_table1$low_income %in% "NoAnswer"), ]
+income.wilcox <- wilcox.test(nMatch ~ low_income, data = person_table1_income)
+income.wilcox
+ddply(person_table1_income, c("low_income"), summarise,
+               N    = length(nMatch),
+               mean = mean(nMatch),
+               sd   = sd(nMatch)
+)
+```
+
+
+```{r, Figure 2 TEC Academic}
+####################################################################################################
+#                                        Figure 2 TEC Academic                                     #
+####################################################################################################
+####################################################################################################
+#                                    9-Grid Plots Academic Only Part 1                             #
+####################################################################################################
+##############################################################################################
+#                                     Read in Data                                           #
+##############################################################################################
+# AoU data
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string")
+
+person_condition_df_phecode_phenotype$zip <- sub("^.*([0-9]{3}).*", "\\1", person_condition_df_phecode_phenotype$value_as_string)
+# Remove rows with invalid zip (000)
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[-which(person_condition_df_phecode_phenotype$zip %in% "000"), ]
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
+# Code sex as male, female, or other to match with CTgov 
+person_condition_df_phecode_phenotype$sex_at_birth_concept_id[which(!(person_condition_df_phecode_phenotype$sex_at_birth_concept_id %in% c(45880669, 45878463)))] <- 9999999999
+
+# CTgov OTH data
+trial_dat_expanded_zip_OTH <- as.data.table(fread("trial_dat_expanded_zip_OTH.csv", header = TRUE))
+trial_dat_expanded_zip_OTH <- trial_dat_expanded_zip_OTH[, -1]
+trial_dat_expanded_zip_OTH <- trial_dat_expanded_zip_OTH[which(trial_dat_expanded_zip_OTH$StudyType %in% "Interventional"), ]
+trial_dat_expanded_zip_OTH <- trial_dat_expanded_zip_OTH[, c("StudyType"):= NULL]
+trial_dat_expanded_zip_OTH <- trial_dat_expanded_zip_OTH[, c("V1"):= NULL]
+trial_dat_expanded_zip_OTH$MinimumAge <- as.double(trial_dat_expanded_zip_OTH$MinimumAge)
+trial_dat_expanded_zip_OTH$Gender <- as.double(trial_dat_expanded_zip_OTH$Gender)
+trial_dat_expanded_zip_OTH$Zip <- sprintf("%03d", as.numeric(trial_dat_expanded_zip_OTH$Zip))
+names(trial_dat_expanded_zip_OTH) <- c("NCTId", "sex_at_birth_concept_id", "MinimumAge", "MaximumAge", "zip", "Phecode")
+
+#########################################################################################################
+#                              Match Based on Age, Sex and Zip                                          #
+#########################################################################################################
+# For each participant, count the number of studies s/he is eligible for
+AoU_to_CTgov_wZip_Trial_OTH <- trial_dat_expanded_zip_OTH[person_condition_df_phecode_phenotype, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_OTH$person_id <- person_condition_df_phecode_phenotype$person_id
+AoU_to_CTgov_wZip_Trial_OTH_ReturnOfValue <- AoU_to_CTgov_wZip_Trial_OTH
+counts_wZip_Trial_OTH <- AoU_to_CTgov_wZip_Trial_OTH_ReturnOfValue %>% group_by(Phecode) %>% summarise(n_participant = n_distinct(person_id), n_study = n_distinct(unlist(V1)[!is.na(unlist(V1))])) %>% distinct()
+
+# Extract the top 50 most frequent phenotypes
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("V1"):=NULL]
+topConditions <- person_condition_df_phecode_phenotype %>% group_by(PheCode) %>% summarise(n_participant = n_distinct(person_id))
+topConditions <- topConditions[order(topConditions$n_participant, decreasing = TRUE), ]
+topConditions <- as.data.table(topConditions[1:20, ])
+names(topConditions) <- c("Phecode", "n_participant")
+
+counts_wZip_Trial_OTH <- counts_wZip_Trial_OTH[which(counts_wZip_Trial_OTH$Phecode %in% topConditions$Phecode), ]
+counts_wZip_Trial_OTH <- counts_wZip_Trial_OTH[which(counts_wZip_Trial_OTH$n_participant >= 21), ]
+# Read in PheCode files
+phecode_icd9 <- as.data.table(fread("phecode_icd9_rolled.csv", header = TRUE))
+phecode_icd10 <- as.data.table(fread("phecode_icd10.csv", header = TRUE))
+phecode_icd10cm <- as.data.table(fread("Phecode_map_v1_2_icd10cm_beta.csv", header = TRUE))
+names(phecode_icd9) <- c("condition_source_value", names(phecode_icd9)[-1])
+names(phecode_icd10) <- c("condition_source_value", names(phecode_icd10)[-1])
+names(phecode_icd10cm) <- c("condition_source_value", "icd10cm_str", "PheCode", "Phenotype", "exclude_range", "exclude_name", "leaf", "rollup")
+
+Phecode_Phenotype <- rbind(phecode_icd9[, c("PheCode", "Phenotype")],
+                           phecode_icd10[, c("PheCode", "Phenotype")],
+                           phecode_icd10cm[, c("PheCode", "Phenotype")])
+names(Phecode_Phenotype) <- c("Phecode", "Phenotype")
+Phecode_Phenotype <- Phecode_Phenotype %>% distinct()
+# There are a few where the Phecode exists but the phenotype is empty, so remove those
+Phecode_Phenotype <- Phecode_Phenotype[-which(Phecode_Phenotype$Phenotype %in% ""), ]
+# Obtain phenotype by merging
+counts_wZip_Trial_OTH <- as.data.table(counts_wZip_Trial_OTH)
+counts_wZip_Trial_OTH <- Phecode_Phenotype[counts_wZip_Trial_OTH, on = "Phecode"]
+write.csv(counts_wZip_Trial_OTH, file = "counts_wZip_Trial_OTH.csv")
+
+####################################################################################################
+#                                    9-Grid Plots OTH Only Part 2                                  #
+####################################################################################################
+counts_wZip_Trial_OTH <- fread("counts_wZip_Trial_OTH.csv", header = TRUE)
+counts_wZip_Trial_OTH <- counts_wZip_Trial_OTH[order(counts_wZip_Trial_OTH$n_participant, decreasing = TRUE),]
+counts_wZip_Trial_OTH <- counts_wZip_Trial_OTH[1:20, ]
+topConditions <- counts_wZip_Trial_OTH$Phecode
+counts_wZip_Trial_OTH <- counts_wZip_Trial_OTH[, c("Phenotype", "n_participant", "n_study")]
+
+#######################################################################################################
+#                                         Original Plot                                               #
+#######################################################################################################
+counts_plot <- plot_ly(data = counts_wZip_Trial_OTH,
+                       x = ~n_participant,
+                       y = ~n_study,
+                       hoverinfo = 'text',
+                       text = ~I(Phenotype),
+                       mode = "markers",
+                       colors = "Set3",
+                       hovertemplate = paste(
+                         "<b>%{text}</b><br><br>",
+                         "%{yaxis.title.text}: %{y:,.0f}<br>",
+                         "%{xaxis.title.text}: %{x:,.0f}<br>",
+                         "<extra></extra>")) 
+
+counts_plot
+
+#############################################################################################################
+#                               Quantile Grid Label Plot log2(y + 1) transformation                         #
+#############################################################################################################
+counts_wZip_Trial_OTH$trans_n_study <- log2(counts_wZip_Trial_OTH$n_study + 2)
+participant_min <- min(counts_wZip_Trial_OTH$n_participant)
+participant_max <- max(counts_wZip_Trial_OTH$n_participant)
+study_min <- min(counts_wZip_Trial_OTH$trans_n_study)
+study_max <- max(counts_wZip_Trial_OTH$trans_n_study)
+
+participant_q10 <- quantile(counts_wZip_Trial_OTH$n_participant, .20)
+participant_q90 <- quantile(counts_wZip_Trial_OTH$n_participant, .80)
+study_q10 <- quantile(counts_wZip_Trial_OTH$trans_n_study, .20)
+study_q90 <- quantile(counts_wZip_Trial_OTH$trans_n_study, .80)
+
+vline <- function(x = 0, color = "gray") {
+  list(
+    type = "line", 
+    y0 = 0, 
+    y1 = 1, 
+    yref = "paper",
+    x0 = x, 
+    x1 = x, 
+    line = list(color = color, dash = "dot")
+  )
+}
+
+hline <- function(y = 0, color = "gray") {
+  list(
+    type = "line", 
+    x0 = 0, 
+    x1 = 1, 
+    xref = "paper",
+    y0 = y, 
+    y1 = y, 
+    line = list(color = color, dash = "dot")
+  )
+}
+
+
+counts_no_middle <- counts_wZip_Trial_OTH %>% filter((participant_q10 > n_participant) | (n_participant > participant_q90) | (study_q10 > trans_n_study) | (trans_n_study > study_q90)) 
+
+a <- list(
+  x = counts_no_middle$n_participant,
+  y = counts_no_middle$trans_n_study,
+  text = counts_no_middle$Phenotype,
+  xref = "x",
+  yref = "y",
+  #   showarrow = TRUE,
+  #   arrowsize = .5,
+  #   arrowhead = 2,
+  ax = -35,
+  ay = -30
+)
+
+####################################################################################################
+#                                    9-Grid Plots OTH Only Part 3                                  #
+####################################################################################################
+
+#############################################################################################################
+#                                     Manual Quantile Grid Label Plot                                       #
+#############################################################################################################
+
+# counts_no_middle <- counts_wZip_Trial_OTH %>% filter((participant_q10 > n_participant) | (n_participant > participant_q90) | (study_q10 > trans_n_study) | (trans_n_study > study_q90)) 
+# counts_middle <- counts_wZip_Trial_OTH %>% filter((n_participant >= participant_q10) & (n_participant <= participant_q90) & (trans_n_study >= study_q10) & (trans_n_study <= study_q90))
+quantile_label_counts_plot <- plot_ly(counts_wZip_Trial_OTH, x = ~n_participant, y = ~trans_n_study)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% add_markers(x = counts_wZip_Trial_OTH$n_participant,
+                                                                         y = counts_wZip_Trial_OTH$trans_n_study,
+                                                                         showlegend = F)
+# quantile_label_counts_plot <- quantile_label_counts_plot %>% add_markers(x = counts_middle$n_participant,
+#                                                                          y = counts_middle$trans_n_study,
+#                                                                          marker = list(color = "gray"), showlegend = F)
+
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(
+  shapes = list(vline(participant_q10), vline(participant_q90),
+                hline(study_q10), hline(study_q90),
+                # Row 1
+                # blue 75, red 25
+                list(type = "rect",
+                     fillcolor = "#FFC2D4FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 25
+                list(type = "rect",
+                     fillcolor = "#BFA7DEFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 25
+                list(type = "rect",
+                     fillcolor = "#BD8DDAFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below"),
+                # Row 2
+                # blue 75, red 50
+                list(type = "rect",
+                     fillcolor = "#FFDAE0FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 50
+                list(type = "rect",
+                     fillcolor = "#CCBAE1FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 50
+                list(type = "rect",
+                     fillcolor = "#C7A2DBFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below"),
+                # Row 3
+                # blue 75, red 75
+                list(type = "rect",
+                     fillcolor = "white",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 75
+                list(type = "rect",
+                     fillcolor = "#C3DFF7FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 75
+                list(type = "rect",
+                     fillcolor = "#B7C9F7FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below")),
+  xaxis = list(range=c(participant_min-5000,participant_max+5000)),
+  yaxis = list(range=c(0,study_max+1)))
+
+quantile_label_counts_plot
+
+text_right_concept <- c("Other headache syndromes", "Chronic pain", "Osteoarthrosis, localized, primary", "Abdominal pain", "Nonspecific chest pain", "Back pain")
+text_top_concept <- c("Pain in joint", "Hyperlipidemia",
+                      "Depression", "Obesity", "Cough",
+                      "Vitamin D deficiency", "Tobacco use disorder", "Major depressive disorder") 
+text_left_concept <- c("Type 2 diabetes", "Essential hypertension")
+text_bottom_concept <- c("Malaise and fatigue", "Other anemias", "Anxiety disorder", "Pain in limb", "GERD", "Shortness of breath")
+text_right_dat <- counts_wZip_Trial_OTH[which(counts_wZip_Trial_OTH$Phenotype %in% text_right_concept), ]
+text_left_dat <- counts_wZip_Trial_OTH[which(counts_wZip_Trial_OTH$Phenotype %in% text_left_concept), ]
+text_top_dat <- counts_wZip_Trial_OTH[which(counts_wZip_Trial_OTH$Phenotype %in% text_top_concept), ]
+text_bottom_dat <- counts_wZip_Trial_OTH[which(counts_wZip_Trial_OTH$Phenotype %in% text_bottom_concept), ]
+
+text_right <- list(
+  x = text_right_dat$n_participant,
+  y = text_right_dat$trans_n_study,
+  text = text_right_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  xanchor = "left"
+)
+
+text_top <- list(
+  x = text_top_dat$n_participant,
+  y = text_top_dat$trans_n_study,
+  text = text_top_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  yanchor = "bottom"
+)
+
+text_left <- list(
+  x = text_left_dat$n_participant,
+  y = text_left_dat$trans_n_study,
+  text = text_left_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  xanchor = "right"
+)
+
+text_bottom <- list(
+  x = text_bottom_dat$n_participant,
+  y = text_bottom_dat$trans_n_study,
+  text = text_bottom_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  yanchor = "top"
+)
+
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_right)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_left)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_top)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_bottom)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(xaxis = list(title = "Number of Participants"),
+                                                                    yaxis = list(title = "Number of Eligible Trials"),
+                                                                    font = list(size = 15))
+y_labels <- 2^(1:10)-2
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(yaxis = list(
+  ticktext = y_labels,
+  tickvals = 1:10,
+  range = c(-1, 10),
+  xaxis = list(range = c(0, 90000))
+))
+quantile_label_counts_plot
+```
+
+```{r, Figure 2 TEC Industry}
+####################################################################################################
+#                                      Figure 2 TEC Industry                                       #
+####################################################################################################
+####################################################################################################
+#                                    9-Grid Plots Industry Only Part 1                             #
+####################################################################################################
+##############################################################################################
+#                                     Read in Data                                           #
+##############################################################################################
+# AoU data
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string")
+
+person_condition_df_phecode_phenotype$zip <- sub("^.*([0-9]{3}).*", "\\1", person_condition_df_phecode_phenotype$value_as_string)
+# Remove rows with invalid zip (000)
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[-which(person_condition_df_phecode_phenotype$zip %in% "000"), ]
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
+# Code sex as male, female, or other to match with CTgov 
+person_condition_df_phecode_phenotype$sex_at_birth_concept_id[which(!(person_condition_df_phecode_phenotype$sex_at_birth_concept_id %in% c(45880669, 45878463)))] <- 9999999999
+
+# CTgov IND data
+trial_dat_expanded_zip_IND <- as.data.table(fread("trial_dat_expanded_zip_IND.csv", header = TRUE))
+trial_dat_expanded_zip_IND <- trial_dat_expanded_zip_IND[, -1]
+trial_dat_expanded_zip_IND <- trial_dat_expanded_zip_IND[which(trial_dat_expanded_zip_IND$StudyType %in% "Interventional"), ]
+trial_dat_expanded_zip_IND <- trial_dat_expanded_zip_IND[, c("StudyType"):= NULL]
+trial_dat_expanded_zip_IND <- trial_dat_expanded_zip_IND[, c("V1"):= NULL]
+trial_dat_expanded_zip_IND$MinimumAge <- as.double(trial_dat_expanded_zip_IND$MinimumAge)
+trial_dat_expanded_zip_IND$Gender <- as.double(trial_dat_expanded_zip_IND$Gender)
+trial_dat_expanded_zip_IND$Zip <- sprintf("%03d", as.numeric(trial_dat_expanded_zip_IND$Zip))
+names(trial_dat_expanded_zip_IND) <- c("NCTId", "sex_at_birth_concept_id", "MinimumAge", "MaximumAge", "zip", "Phecode")
+
+#########################################################################################################
+#                              Match Based on Age, Sex and Zip                                          #
+#########################################################################################################
+# For each participant, count the number of studies s/he is eligible for
+AoU_to_CTgov_wZip_Trial_IND <- trial_dat_expanded_zip_IND[person_condition_df_phecode_phenotype, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_IND$person_id <- person_condition_df_phecode_phenotype$person_id
+AoU_to_CTgov_wZip_Trial_IND_ReturnOfValue <- AoU_to_CTgov_wZip_Trial_IND
+counts_wZip_Trial_IND <- AoU_to_CTgov_wZip_Trial_IND_ReturnOfValue %>% group_by(Phecode) %>% summarise(n_participant = n_distinct(person_id), n_study = n_distinct(unlist(V1)[!is.na(unlist(V1))])) %>% distinct()
+
+# Extract the top 20 most frequent phenotypes
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("V1"):=NULL]
+topConditions <- person_condition_df_phecode_phenotype %>% group_by(PheCode) %>% summarise(n_participant = n_distinct(person_id))
+topConditions <- topConditions[order(topConditions$n_participant, decreasing = TRUE), ]
+topConditions <- as.data.table(topConditions[1:20, ])
+names(topConditions) <- c("Phecode", "n_participant")
+
+counts_wZip_Trial_IND <- counts_wZip_Trial_IND[which(counts_wZip_Trial_IND$Phecode %in% topConditions$Phecode), ]
+counts_wZip_Trial_IND <- counts_wZip_Trial_IND[which(counts_wZip_Trial_IND$n_participant >= 21), ]
+# Read in PheCode files
+phecode_icd9 <- as.data.table(fread("phecode_icd9_rolled.csv", header = TRUE))
+phecode_icd10 <- as.data.table(fread("phecode_icd10.csv", header = TRUE))
+phecode_icd10cm <- as.data.table(fread("Phecode_map_v1_2_icd10cm_beta.csv", header = TRUE))
+names(phecode_icd9) <- c("condition_source_value", names(phecode_icd9)[-1])
+names(phecode_icd10) <- c("condition_source_value", names(phecode_icd10)[-1])
+names(phecode_icd10cm) <- c("condition_source_value", "icd10cm_str", "PheCode", "Phenotype", "exclude_range", "exclude_name", "leaf", "rollup")
+
+Phecode_Phenotype <- rbind(phecode_icd9[, c("PheCode", "Phenotype")],
+                           phecode_icd10[, c("PheCode", "Phenotype")],
+                           phecode_icd10cm[, c("PheCode", "Phenotype")])
+names(Phecode_Phenotype) <- c("Phecode", "Phenotype")
+Phecode_Phenotype <- Phecode_Phenotype %>% distinct()
+# There are a few where the Phecode exists but the phenotype is empty, so remove those
+Phecode_Phenotype <- Phecode_Phenotype[-which(Phecode_Phenotype$Phenotype %in% ""), ]
+# Obtain phenotype by merging
+counts_wZip_Trial_IND <- as.data.table(counts_wZip_Trial_IND)
+counts_wZip_Trial_IND <- Phecode_Phenotype[counts_wZip_Trial_IND, on = "Phecode"]
+write.csv(counts_wZip_Trial_IND, file = "counts_wZip_Trial_IND.csv")
+
+####################################################################################################
+#                                    9-Grid Plots IND Only Part 2                                  #
+####################################################################################################
+counts_wZip_Trial_IND <- fread("counts_wZip_Trial_IND.csv", header = TRUE)
+counts_wZip_Trial_IND <- counts_wZip_Trial_IND[order(counts_wZip_Trial_IND$n_participant, decreasing = TRUE),]
+counts_wZip_Trial_IND <- counts_wZip_Trial_IND[1:20, ]
+topConditions <- counts_wZip_Trial_IND$Phecode
+counts_wZip_Trial_IND <- counts_wZip_Trial_IND[, c("Phenotype", "n_participant", "n_study")]
+
+#######################################################################################################
+#                                         Original Plot                                               #
+#######################################################################################################
+counts_plot <- plot_ly(data = counts_wZip_Trial_IND,
+                       x = ~n_participant,
+                       y = ~n_study,
+                       hoverinfo = 'text',
+                       text = ~I(Phenotype),
+                       mode = "markers",
+                       colors = "Set3",
+                       hovertemplate = paste(
+                         "<b>%{text}</b><br><br>",
+                         "%{yaxis.title.text}: %{y:,.0f}<br>",
+                         "%{xaxis.title.text}: %{x:,.0f}<br>",
+                         "<extra></extra>")) 
+
+counts_plot
+
+#############################################################################################################
+#                               Quantile Grid Label Plot log2(y + 1) transformation                         #
+#############################################################################################################
+counts_wZip_Trial_IND$trans_n_study <- log2(counts_wZip_Trial_IND$n_study + 2)
+participant_min <- min(counts_wZip_Trial_IND$n_participant)
+participant_max <- max(counts_wZip_Trial_IND$n_participant)
+study_min <- min(counts_wZip_Trial_IND$trans_n_study)
+study_max <- max(counts_wZip_Trial_IND$trans_n_study)
+
+participant_q10 <- quantile(counts_wZip_Trial_IND$n_participant, .20)
+participant_q90 <- quantile(counts_wZip_Trial_IND$n_participant, .80)
+study_q10 <- quantile(counts_wZip_Trial_IND$trans_n_study, .20)
+study_q90 <- quantile(counts_wZip_Trial_IND$trans_n_study, .80)
+
+vline <- function(x = 0, color = "gray") {
+  list(
+    type = "line", 
+    y0 = 0, 
+    y1 = 1, 
+    yref = "paper",
+    x0 = x, 
+    x1 = x, 
+    line = list(color = color, dash = "dot")
+  )
+}
+
+hline <- function(y = 0, color = "gray") {
+  list(
+    type = "line", 
+    x0 = 0, 
+    x1 = 1, 
+    xref = "paper",
+    y0 = y, 
+    y1 = y, 
+    line = list(color = color, dash = "dot")
+  )
+}
+
+
+counts_no_middle <- counts_wZip_Trial_IND %>% filter((participant_q10 > n_participant) | (n_participant > participant_q90) | (study_q10 > trans_n_study) | (trans_n_study > study_q90)) 
+
+a <- list(
+  x = counts_no_middle$n_participant,
+  y = counts_no_middle$trans_n_study,
+  text = counts_no_middle$Phenotype,
+  xref = "x",
+  yref = "y",
+  #   showarrow = TRUE,
+  #   arrowsize = .5,
+  #   arrowhead = 2,
+  ax = -35,
+  ay = -30
+)
+
+####################################################################################################
+#                                    9-Grid Plots IND Only Part 3                                  #
+####################################################################################################
+
+#############################################################################################################
+#                                     Manual Quantile Grid Label Plot                                       #
+#############################################################################################################
+
+# counts_no_middle <- counts_wZip_Trial_IND %>% filter((participant_q10 > n_participant) | (n_participant > participant_q90) | (study_q10 > trans_n_study) | (trans_n_study > study_q90)) 
+# counts_middle <- counts_wZip_Trial_IND %>% filter((n_participant >= participant_q10) & (n_participant <= participant_q90) & (trans_n_study >= study_q10) & (trans_n_study <= study_q90))
+quantile_label_counts_plot <- plot_ly(counts_wZip_Trial_IND, x = ~n_participant, y = ~trans_n_study)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% add_markers(x = counts_wZip_Trial_IND$n_participant,
+                                                                         y = counts_wZip_Trial_IND$trans_n_study,
+                                                                         showlegend = F)
+# quantile_label_counts_plot <- quantile_label_counts_plot %>% add_markers(x = counts_middle$n_participant,
+#                                                                          y = counts_middle$trans_n_study,
+#                                                                          marker = list(color = "gray"), showlegend = F)
+
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(
+  shapes = list(vline(participant_q10), vline(participant_q90),
+                hline(study_q10), hline(study_q90),
+                # Row 1
+                # blue 75, red 25
+                list(type = "rect",
+                     fillcolor = "#FFC2D4FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 25
+                list(type = "rect",
+                     fillcolor = "#BFA7DEFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 25
+                list(type = "rect",
+                     fillcolor = "#BD8DDAFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below"),
+                # Row 2
+                # blue 75, red 50
+                list(type = "rect",
+                     fillcolor = "#FFDAE0FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 50
+                list(type = "rect",
+                     fillcolor = "#CCBAE1FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 50
+                list(type = "rect",
+                     fillcolor = "#C7A2DBFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below"),
+                # Row 3
+                # blue 75, red 75
+                list(type = "rect",
+                     fillcolor = "white",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 75
+                list(type = "rect",
+                     fillcolor = "#C3DFF7FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 75
+                list(type = "rect",
+                     fillcolor = "#B7C9F7FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below")),
+  xaxis = list(range=c(participant_min-5000,participant_max+5000)),
+  yaxis = list(range=c(0,study_max+1)))
+
+quantile_label_counts_plot
+
+text_right_concept <- c("Other headache syndromes", "Osteoarthrosis, localized, primary", 
+                        "Tobacco use disorder", "Anxiety disorder", "Chronic pain", "Back pain")
+text_top_concept <- c("Pain in joint", "Abdominal pain", 
+                      "Depression", "Vitamin D deficiency", "Other anemias", "Type 2 diabetes") 
+text_left_concept <- c("Essential hypertension", "Pain in limb", "Nonspecific chest pain", "GERD", "Obesity", "Cough")
+text_bottom_concept <- c("Malaise and fatigue", "Hyperlipidemia", "Shortness of breath", "Major depressive disorder")
+text_right_dat <- counts_wZip_Trial_IND[which(counts_wZip_Trial_IND$Phenotype %in% text_right_concept), ]
+text_left_dat <- counts_wZip_Trial_IND[which(counts_wZip_Trial_IND$Phenotype %in% text_left_concept), ]
+text_top_dat <- counts_wZip_Trial_IND[which(counts_wZip_Trial_IND$Phenotype %in% text_top_concept), ]
+text_bottom_dat <- counts_wZip_Trial_IND[which(counts_wZip_Trial_IND$Phenotype %in% text_bottom_concept), ]
+
+text_right <- list(
+  x = text_right_dat$n_participant,
+  y = text_right_dat$trans_n_study,
+  text = text_right_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  xanchor = "left"
+)
+
+text_top <- list(
+  x = text_top_dat$n_participant,
+  y = text_top_dat$trans_n_study,
+  text = text_top_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  yanchor = "bottom"
+)
+
+text_left <- list(
+  x = text_left_dat$n_participant,
+  y = text_left_dat$trans_n_study,
+  text = text_left_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  xanchor = "right"
+)
+
+text_bottom <- list(
+  x = text_bottom_dat$n_participant,
+  y = text_bottom_dat$trans_n_study,
+  text = text_bottom_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  yanchor = "top"
+)
+
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_right)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_left)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_top)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_bottom)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(xaxis = list(title = "Number of Participants"),
+                                                                    yaxis = list(title = "Number of Eligible Trials"),
+                                                                    font = list(size = 15))
+y_labels <- 2^(1:10)-2
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(yaxis = list(
+  ticktext = y_labels,
+  tickvals = 1:10,
+  range = c(-1, 10),
+  xaxis = list(range = c(0, 90000))
+))
+quantile_label_counts_plot
+```
+
+```{r, Figure 2 TEC NIH}
+####################################################################################################
+#                                        Figure 2 TEC NIH                                          #
+####################################################################################################
+####################################################################################################
+#                                    9-Grid Plots NIH Only Part 1                                  #
+####################################################################################################
+##############################################################################################
+#                                     Read in Data                                           #
+##############################################################################################
+# AoU data
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string")
+
+person_condition_df_phecode_phenotype$zip <- sub("^.*([0-9]{3}).*", "\\1", person_condition_df_phecode_phenotype$value_as_string)
+# Remove rows with invalid zip (000)
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[-which(person_condition_df_phecode_phenotype$zip %in% "000"), ]
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
+# Code sex as male, female, or other to match with CTgov 
+person_condition_df_phecode_phenotype$sex_at_birth_concept_id[which(!(person_condition_df_phecode_phenotype$sex_at_birth_concept_id %in% c(45880669, 45878463)))] <- 9999999999
+
+# CTgov NIH data
+trial_dat_expanded_zip_NIH <- as.data.table(fread("trial_dat_expanded_zip_NIH.csv", header = TRUE))
+trial_dat_expanded_zip_NIH <- trial_dat_expanded_zip_NIH[, -1]
+trial_dat_expanded_zip_NIH <- trial_dat_expanded_zip_NIH[which(trial_dat_expanded_zip_NIH$StudyType %in% "Interventional"), ]
+trial_dat_expanded_zip_NIH <- trial_dat_expanded_zip_NIH[, c("StudyType"):= NULL]
+trial_dat_expanded_zip_NIH <- trial_dat_expanded_zip_NIH[, c("V1"):= NULL]
+trial_dat_expanded_zip_NIH$MinimumAge <- as.double(trial_dat_expanded_zip_NIH$MinimumAge)
+trial_dat_expanded_zip_NIH$Gender <- as.double(trial_dat_expanded_zip_NIH$Gender)
+trial_dat_expanded_zip_NIH$Zip <- sprintf("%03d", as.numeric(trial_dat_expanded_zip_NIH$Zip))
+names(trial_dat_expanded_zip_NIH) <- c("NCTId", "sex_at_birth_concept_id", "MinimumAge", "MaximumAge", "zip", "Phecode")
+
+#########################################################################################################
+#                              Match Based on Age, Sex and Zip                                          #
+#########################################################################################################
+# For each participant, count the number of studies s/he is eligible for
+AoU_to_CTgov_wZip_Trial_NIH <- trial_dat_expanded_zip_NIH[person_condition_df_phecode_phenotype, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_NIH$person_id <- person_condition_df_phecode_phenotype$person_id
+AoU_to_CTgov_wZip_Trial_NIH_ReturnOfValue <- AoU_to_CTgov_wZip_Trial_NIH
+counts_wZip_Trial_NIH <- AoU_to_CTgov_wZip_Trial_NIH_ReturnOfValue %>% group_by(Phecode) %>% summarise(n_participant = n_distinct(person_id), n_study = n_distinct(unlist(V1)[!is.na(unlist(V1))])) %>% distinct()
+
+# Extract the top 20 most frequent phenotypes
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("V1"):=NULL]
+topConditions <- person_condition_df_phecode_phenotype %>% group_by(PheCode) %>% summarise(n_participant = n_distinct(person_id))
+topConditions <- topConditions[order(topConditions$n_participant, decreasing = TRUE), ]
+topConditions <- as.data.table(topConditions[1:20, ])
+names(topConditions) <- c("Phecode", "n_participant")
+
+counts_wZip_Trial_NIH <- counts_wZip_Trial_NIH[which(counts_wZip_Trial_NIH$Phecode %in% topConditions$Phecode), ]
+counts_wZip_Trial_NIH <- counts_wZip_Trial_NIH[which(counts_wZip_Trial_NIH$n_participant >= 21), ]
+# Read in PheCode files
+phecode_icd9 <- as.data.table(fread("phecode_icd9_rolled.csv", header = TRUE))
+phecode_icd10 <- as.data.table(fread("phecode_icd10.csv", header = TRUE))
+phecode_icd10cm <- as.data.table(fread("Phecode_map_v1_2_icd10cm_beta.csv", header = TRUE))
+names(phecode_icd9) <- c("condition_source_value", names(phecode_icd9)[-1])
+names(phecode_icd10) <- c("condition_source_value", names(phecode_icd10)[-1])
+names(phecode_icd10cm) <- c("condition_source_value", "icd10cm_str", "PheCode", "Phenotype", "exclude_range", "exclude_name", "leaf", "rollup")
+
+Phecode_Phenotype <- rbind(phecode_icd9[, c("PheCode", "Phenotype")],
+                     phecode_icd10[, c("PheCode", "Phenotype")],
+                     phecode_icd10cm[, c("PheCode", "Phenotype")])
+names(Phecode_Phenotype) <- c("Phecode", "Phenotype")
+Phecode_Phenotype <- Phecode_Phenotype %>% distinct()
+# There are a few where the Phecode exists but the phenotype is empty, so remove those
+Phecode_Phenotype <- Phecode_Phenotype[-which(Phecode_Phenotype$Phenotype %in% ""), ]
+# Obtain phenotype by merging
+counts_wZip_Trial_NIH <- as.data.table(counts_wZip_Trial_NIH)
+counts_wZip_Trial_NIH <- Phecode_Phenotype[counts_wZip_Trial_NIH, on = "Phecode"]
+write.csv(counts_wZip_Trial_NIH, file = "counts_wZip_Trial_NIH.csv")
+
+####################################################################################################
+#                                    9-Grid Plots NIH Only Part 2                                  #
+####################################################################################################
+counts_wZip_Trial_NIH <- fread("counts_wZip_Trial_NIH.csv", header = TRUE)
+counts_wZip_Trial_NIH <- counts_wZip_Trial_NIH[order(counts_wZip_Trial_NIH$n_participant, decreasing = TRUE),]
+counts_wZip_Trial_NIH <- counts_wZip_Trial_NIH[1:20, ]
+topConditions <- counts_wZip_Trial_NIH$Phecode
+counts_wZip_Trial_NIH <- counts_wZip_Trial_NIH[, c("Phenotype", "n_participant", "n_study")]
+
+#######################################################################################################
+#                                         Original Plot                                               #
+#######################################################################################################
+counts_plot <- plot_ly(data = counts_wZip_Trial_NIH,
+                       x = ~n_participant,
+                       y = ~n_study,
+                       hoverinfo = 'text',
+                       text = ~I(Phenotype),
+                       mode = "markers",
+                       colors = "Set3",
+                       hovertemplate = paste(
+                         "<b>%{text}</b><br><br>",
+                         "%{yaxis.title.text}: %{y:,.0f}<br>",
+                         "%{xaxis.title.text}: %{x:,.0f}<br>",
+                         "<extra></extra>")) 
+
+counts_plot
+
+#############################################################################################################
+#                               Quantile Grid Label Plot log2(y + 1) transformation                         #
+#############################################################################################################
+counts_wZip_Trial_NIH$trans_n_study <- log2(counts_wZip_Trial_NIH$n_study + 2)
+participant_min <- min(counts_wZip_Trial_NIH$n_participant)
+participant_max <- max(counts_wZip_Trial_NIH$n_participant)
+study_min <- min(counts_wZip_Trial_NIH$trans_n_study)
+study_max <- max(counts_wZip_Trial_NIH$trans_n_study)
+
+participant_q10 <- quantile(counts_wZip_Trial_NIH$n_participant, .20)
+participant_q90 <- quantile(counts_wZip_Trial_NIH$n_participant, .80)
+study_q10 <- quantile(counts_wZip_Trial_NIH$trans_n_study, .20)
+study_q90 <- quantile(counts_wZip_Trial_NIH$trans_n_study, .80)
+
+vline <- function(x = 0, color = "gray") {
+  list(
+    type = "line", 
+    y0 = 0, 
+    y1 = 1, 
+    yref = "paper",
+    x0 = x, 
+    x1 = x, 
+    line = list(color = color, dash = "dot")
+  )
+}
+
+hline <- function(y = 0, color = "gray") {
+  list(
+    type = "line", 
+    x0 = 0, 
+    x1 = 1, 
+    xref = "paper",
+    y0 = y, 
+    y1 = y, 
+    line = list(color = color, dash = "dot")
+  )
+}
+
+
+counts_no_middle <- counts_wZip_Trial_NIH %>% filter((participant_q10 > n_participant) | (n_participant > participant_q90) | (study_q10 > trans_n_study) | (trans_n_study > study_q90)) 
+
+a <- list(
+  x = counts_no_middle$n_participant,
+  y = counts_no_middle$trans_n_study,
+  text = counts_no_middle$Phenotype,
+  xref = "x",
+  yref = "y",
+  #   showarrow = TRUE,
+  #   arrowsize = .5,
+  #   arrowhead = 2,
+  ax = -35,
+  ay = -30
+)
+
+####################################################################################################
+#                                    9-Grid Plots NIH Only Part 3                                  #
+####################################################################################################
+
+#############################################################################################################
+#                                     Manual Quantile Grid Label Plot                                       #
+#############################################################################################################
+
+# counts_no_middle <- counts_wZip_Trial_NIH %>% filter((participant_q10 > n_participant) | (n_participant > participant_q90) | (study_q10 > trans_n_study) | (trans_n_study > study_q90)) 
+# counts_middle <- counts_wZip_Trial_NIH %>% filter((n_participant >= participant_q10) & (n_participant <= participant_q90) & (trans_n_study >= study_q10) & (trans_n_study <= study_q90))
+quantile_label_counts_plot <- plot_ly(counts_wZip_Trial_NIH, x = ~n_participant, y = ~trans_n_study)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% add_markers(x = counts_wZip_Trial_NIH$n_participant,
+                                                                         y = counts_wZip_Trial_NIH$trans_n_study,
+                                                                         showlegend = F)
+# quantile_label_counts_plot <- quantile_label_counts_plot %>% add_markers(x = counts_middle$n_participant,
+#                                                                          y = counts_middle$trans_n_study,
+#                                                                          marker = list(color = "gray"), showlegend = F)
+
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(
+  shapes = list(vline(participant_q10), vline(participant_q90),
+                hline(study_q10), hline(study_q90),
+                # Row 1
+                # blue 75, red 25
+                list(type = "rect",
+                     fillcolor = "#FFC2D4FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 25
+                list(type = "rect",
+                     fillcolor = "#BFA7DEFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 25
+                list(type = "rect",
+                     fillcolor = "#BD8DDAFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q90,
+                     y1 = study_max+5,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below"),
+                # Row 2
+                # blue 75, red 50
+                list(type = "rect",
+                     fillcolor = "#FFDAE0FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 50
+                list(type = "rect",
+                     fillcolor = "#CCBAE1FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 50
+                list(type = "rect",
+                     fillcolor = "#C7A2DBFF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = study_q10,
+                     y1 = study_q90,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below"),
+                # Row 3
+                # blue 75, red 75
+                list(type = "rect",
+                     fillcolor = "white",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = 0,
+                     x1 = participant_q10,
+                     layer = "below"),
+                # blue 50, red 75
+                list(type = "rect",
+                     fillcolor = "#C3DFF7FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = participant_q10,
+                     x1 = participant_q90,
+                     layer = "below"),
+                # blue 25, red 75
+                list(type = "rect",
+                     fillcolor = "#B7C9F7FF",
+                     line = list(color = "gray"),
+                     opacity = 0.5,
+                     y0 = 0,
+                     y1 = study_q10,
+                     x0 = participant_q90,
+                     x1 = participant_max+5000,
+                     layer = "below")),
+  xaxis = list(range=c(participant_min-5000,participant_max+5000)),
+  yaxis = list(range=c(0,study_max+1)))
+
+quantile_label_counts_plot
+
+text_right_concept <- c("Other headache syndromes", "Osteoarthrosis, localized, primary", "Anxiety disorder", "Shortness of breath", "GERD")
+text_top_concept <- c("Pain in joint", "Hyperlipidemia", "Abdominal pain",
+                      "Depression", "Obesity",
+                      "Chronic pain", "Vitamin D deficiency", "Other anemias", "Cough") 
+text_left_concept <- c("Type 2 diabetes", "Essential hypertension", "Back pain", "Pain in limb", "Nonspecific chest pain")
+text_bottom_concept <- c("Malaise and fatigue", "Tobacco use disorder", "Major depressive disorder")
+text_right_dat <- counts_wZip_Trial_NIH[which(counts_wZip_Trial_NIH$Phenotype %in% text_right_concept), ]
+text_left_dat <- counts_wZip_Trial_NIH[which(counts_wZip_Trial_NIH$Phenotype %in% text_left_concept), ]
+text_top_dat <- counts_wZip_Trial_NIH[which(counts_wZip_Trial_NIH$Phenotype %in% text_top_concept), ]
+text_bottom_dat <- counts_wZip_Trial_NIH[which(counts_wZip_Trial_NIH$Phenotype %in% text_bottom_concept), ]
+
+text_right <- list(
+  x = text_right_dat$n_participant,
+  y = text_right_dat$trans_n_study,
+  text = text_right_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  xanchor = "left"
+)
+
+text_top <- list(
+  x = text_top_dat$n_participant,
+  y = text_top_dat$trans_n_study,
+  text = text_top_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  yanchor = "bottom"
+)
+
+text_left <- list(
+  x = text_left_dat$n_participant,
+  y = text_left_dat$trans_n_study,
+  text = text_left_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  xanchor = "right"
+)
+
+text_bottom <- list(
+  x = text_bottom_dat$n_participant,
+  y = text_bottom_dat$trans_n_study,
+  text = text_bottom_dat$Phenotype,
+  xref = "x",
+  yref = "y",
+  showarrow = FALSE,
+  yanchor = "top"
+)
+
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_right)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_left)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_top)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(annotations = text_bottom)
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(xaxis = list(title = "Number of Participants"),
+                                                                    yaxis = list(title = "Number of Eligible Trials"),
+                                                                    font = list(size = 15))
+y_labels <- 2^(1:10)-2
+quantile_label_counts_plot <- quantile_label_counts_plot %>% layout(yaxis = list(
+  ticktext = y_labels,
+  tickvals = 1:10,
+  range = c(-1, 10),
+  xaxis = list(range = c(0, 90000))
+))
+quantile_label_counts_plot
+```
+
+
+```{r, PheWAS Helper Functions}
+##############################################################################################
+#                                  PheWAS Helper Functions                                   #
+#                                                                                            #
+##############################################################################################
+###########################################################################################################
+# data_fun : Prepares dataset for PheWAS
+# 
+# Input: 
+# data - dataset with person_id, age, sex, Phecode, zip
+# 
+# Output:
+# dataset with person_id, age, sex, Phecode, location, R/E, education level, income level, disability status, n_condition, nMatch
+#
+###########################################################################################################
+data_fun <- function(data){
+  #######################################################################################################
+  #                      tab1: person_id, nMatch (match on condition, age, and sex)                     #
+  #######################################################################################################
+  tab1 <- fread("person_PheWAS.csv", header = TRUE)
+  tab1 <- tab1[, -1]
+
+  #######################################################################################################
+  #                                 tab2: person_id, Phecode                                            #
+  #######################################################################################################
+  tab2 <- as.data.table(data[, c("person_id", "Phecode")]) %>% distinct()
+  # tab2 <- as.data.table(person_condition %>% group_by(person_id) %>% summarise(n_condition = n_distinct(Phecode)))
+
+  #######################################################################################################
+  #                     tab1_tab2: person_id, nMatch, age, sex, location                                # 
+  #                                R/E, education level, income level, disability status                #
+  #######################################################################################################
+  tab1_tab2 <- tab1[tab2, on = "person_id"]
+  tab1_tab2$low_income <- as.factor(tab1_tab2$low_income)
+  tab1_tab2$any_disability <- as.factor(tab1_tab2$any_disability)
+  tab1_tab2$education <- as.factor(tab1_tab2$education)
+  tab1_tab2$location <- as.factor(tab1_tab2$location)
+  tab1_tab2$race_ethnicity <- as.factor(tab1_tab2$race_ethnicity)
+  tab1_tab2$sex_at_birth <- as.factor(tab1_tab2$sex_at_birth)
+  return(tab1_tab2)
+}
+
+
+###########################################################################################################
+# nb_fun : Performs negative-binomial regression nMatch ~ age + sex + Phecode_indicator + location + R/E + disability + income + education
+# 
+# Input: 
+# data - dataset with person_id, n_condition, nMatch, age, sex, Phecode, location
+# Phecode_cur - Phecode of interest
+# 
+# Output:
+# model summary of condition_indicator (effect size, SE, p-value)
+#
+###########################################################################################################
+nb_fun <- function(data, Phecode_cur){
+  dat <- data %>% group_by(person_id) %>% mutate(Phecode_indicator = as.factor(as.integer(any(Phecode %in% Phecode_cur))))
+  dat <- dat %>% dplyr::select(person_id, sex_at_birth, age_in_years, nMatch, Phecode_indicator, location, race_ethnicity, education, low_income, any_disability) %>% distinct()
+  mod <- glm.nb(nMatch ~ relevel(Phecode_indicator, ref = "0") + sex_at_birth + age_in_years + location + race_ethnicity + education + low_income + any_disability, data = dat)
+  summary(mod)$coefficients[2, ]
+}
+
+###########################################################################################################
+# Manhattan plot helper functions
+###########################################################################################################
+phewasManhattan_mod <- function (d, annotate.phenotype.description = T, ...) 
+{
+  if (sum(c("phenotype", "p") %in% names(d)) < 2) 
+    stop("Data input must contain columns phenotype and p.")
+  if (class(d$phenotype) != "character") {
+    if (class(d$phenotype) == "factor") {
+      warning("Factor phenotype input mapped to characters")
+      d$phenotype = as.character(d$phenotype)
+    }
+    else {
+      stop("Non-character or non-factor phenotypes passed in, so an accurate phecode mapping is not possible.")
+    }
+  }
+  if (min(nchar(d$phenotype)) < 3) 
+    warning("Phenotypes with length <3 observed, ensure they are are 0-padded (e.g., \"008\")")
+  d = addPhecodeInfo(d, groupnums = T, groupcolors = T)
+  phenotypeManhattan_mod(d, annotate.phenotype.description = annotate.phenotype.description, 
+                         ...)
+}
+
+
+phenotypeManhattan_mod <- function (d, suggestive.line = 0.05, significant.line, OR.size = F, 
+                                    OR.direction = F, sizes, annotate.level, y.axis.interval = 5, 
+                                    y.axis.label = expression(-log[10](italic(p))), max.y, ...) 
+{
+  if (sum(c("phenotype", "p") %in% names(d)) < 2) 
+    stop("Data input must contain columns phenotype and p.")
+  if ((OR.size | OR.direction) & !length(d$OR)) 
+    stop("OR size or direction requested, but d$OR not provided.")
+  if (OR.size & !is.null(list(...)$sizes)) 
+    stop("You cannot use OR.size=T for OR point sizes and use the second point sizing parameter 'sizes'.")
+  if (OR.direction & !is.null(list(...)$direction)) 
+    stop("You cannot use OR.direction=T for OR direction shapes and use the second point shape parameter 'direction'.")
+  if (max(names(list(...)) %in% c("genomewide.line", "sort.by.p", 
+                                  "sort.by.category.p")) > 0) {
+    stop("'genomewide.line','sort.by.p', and 'sort.by.category.p' parameters have been replaced with 'significant.line','sort.by.value', and 'sort.by.category.value'")
+  }
+  d = d[!is.na(d$p), ]
+  if (missing(significant.line)) 
+    significant.line = suggestive.line/nrow(d)
+  significant.line = -log10(significant.line)
+  suggestive.line = -log10(suggestive.line)
+  if (missing(annotate.level)) {
+    if (is.na(significant.line)) {
+      annotate.level = -log10(min(d$p, na.rm = T))
+    }
+    else {
+      annotate.level = significant.line
+    }
+  }
+  else {
+    annotate.level = -log10(annotate.level)
+  }
+  if (sum(d$p == 0) > 0) 
+    d[d$p == 0, ]$p = .Machine$double.xmin
+  d = d[d$p > 0 & d$p <= 1, ]
+  d$value = -log10(d$p)
+  max.y = ifelse(missing(max.y), max(ceiling(max(d$value)), 
+                                     4.4), max.y)
+  sizing = FALSE
+  if (!missing(sizes)) {
+    if (sizes == T) {
+      if (OR.size) {
+        stop("Both sizes and OR.size are TRUE. Only one size can be used at a time. Please ensure only one parameter is TRUE.")
+      }
+      if (!length(d$size)) {
+        stop("sizes were requested, but no d$size was not provided. Please provide the point size scaling variable in d$size")
+      }
+      sizing = TRUE
+    }
+  }
+  if (OR.size) {
+    sizing = TRUE
+    d$size = d$OR
+    d[d$size < 1, ]$size = 1/d[d$size < 1, ]$size
+  }
+  if (OR.direction) 
+    d$direction = d$OR >= 1
+  plot = phenotypePlot_mod(d, suggestive.line = suggestive.line, 
+                           significant.line = significant.line, sizes = sizing, 
+                           direction = OR.direction, annotate.level = annotate.level, 
+                           y.axis.interval = y.axis.interval, y.axis.label = y.axis.label, 
+                           max.y = max.y, ...)
+  if (OR.size) 
+    plot = suppressMessages(plot + scale_size("Odds Ratio", 
+                                              range = c(2, 5), breaks = wavier(), n.breaks = 3))
+  plot
+}
+
+
+phenotypePlot_mod <- function (d, max.y, max.x, suggestive.line, significant.line, 
+                               size.x.labels = 9, size.y.labels = 9, switch.axis = F, sort.by.value = F, 
+                               sort.by.category.value = F, base.labels = F, annotate.phenotype.description, 
+                               annotate.angle = 0, annotate.size = 5, annotate.level, annotate.phenotype = F, 
+                               annotate.snp.w.phenotype = F, annotate.snp = F, annotate.snp.angle = 0, 
+                               annotate.list, annotate.only.largest = T, lc.labels = F, 
+                               x.group.labels = T, x.phenotype.labels = F, sizes = F, direction = F, 
+                               point.size = 3, use.color = T, color.palette, title = paste0("Phenotype Plot ", 
+                                                                                            date()), x.axis.label = "Phenotypes", y.axis.label = "Values", 
+                               y.axis.interval = 5) 
+{
+  if (sum(c("phenotype", "value") %in% names(d)) < 2) 
+    stop("Data input must contain columns phenotype and value.")
+  if (!missing(annotate.phenotype.description)) {
+    if (is.data.frame(annotate.phenotype.description) && 
+        sum(c("phenotype", "description") %in% names(annotate.phenotype.description)) == 
+        2) {
+      d = merge(d, annotate.phenotype.description)
+      annotate.phenotype.description = T
+    }
+    else if (is.logical(annotate.phenotype.description)) {
+      if (annotate.phenotype.description == T && !length(d$description)) {
+        stop("Annotate.phenotype.description must contain columns phenotype and description, or be TRUE with provided d$description.")
+      }
+    }
+    else {
+      stop("Annotate.phenotype.description must contain columns phenotype and description, or be TRUE with provided d$description.")
+    }
+  }
+  else {
+    annotate.phenotype.description = F
+  }
+  if ((annotate.snp || annotate.snp.w.phenotype) && !("snp" %in% 
+                                                      names(d))) 
+    stop("You requested SNP annotation but d$snp is not defined.")
+  if (annotate.snp.w.phenotype && annotate.snp) 
+    warning("You requested SNP annotation twice")
+  annotate = annotate.phenotype.description || annotate.phenotype || 
+    annotate.snp || annotate.snp.w.phenotype
+  if (annotate && (missing(annotate.level) || is.na(annotate.level)) && 
+      missing(annotate.list)) {
+    warning("You requested annotation, but did not specify annotate.level or annotate.list.")
+    annotate = F
+  }
+  if (!use.color && !missing(color.palette)) 
+    stop("You requested no color, but provided a color palette.")
+  if (use.color) {
+    if (missing(color.palette)) {
+      if (!("color" %in% names(d))) 
+        stop("You requested color, but did not provide a color attribute in d or color.palette")
+      else if (class(d$color) == "factor") 
+        warning("The color attribute is a factor and no color palette is provided: R default color scheme will be used. Convert color to character if it contains color names or codes")
+    }
+    if (!missing(color.palette) && !length(d$color)) {
+      if (length(d$groupnum)) 
+        d$color = d$groupnum
+      else stop("You requested use.color, but d$color or d$groupnum were not provided to distinguish groups.")
+    }
+  }
+  else {
+    d$color = "#000000"
+  }
+  if (sizes && !length(d$size)) 
+    stop("You requested size information, but did not provide d$size")
+  if (direction && !length(d$direction)) 
+    stop("You requested direction information, but did not provide d$direction")
+  if (!sizes) 
+    d$size = point.size
+  if (!annotate.phenotype.description && !annotate.phenotype && 
+      !annotate.snp && !annotate.snp.w.phenotype) 
+    lc.labels = F
+  if (sort.by.value && x.group.labels) 
+    stop("One cannot sort universally by value and have x group labels. Try sort.by.category.value or not labeling the groups.")
+  if ((sort.by.category.value || x.group.labels) && (sum(c("groupnum", 
+                                                           "group") %in% names(d)) < 2)) {
+    stop("Requested group information, but did not provide d$groupnum and d$group.")
+  }
+  if (!("groupnum" %in% names(d))) {
+    d$groupnum = 0
+  }
+  d = d[!(is.na(d$phenotype) | is.na(d$value)), ]
+  d = d[order(d$phenotype), ]
+  if (missing(max.x)) 
+    max.x = length(unique(d$phenotype))
+  phenotypes = aggregate(value ~ phenotype + groupnum, d, FUN = max)
+  phenotypes = phenotypes[order(phenotypes$value, decreasing = T), 
+  ][1:min(nrow(phenotypes), max.x), ]
+  if (sort.by.value) {
+    phenotypes = phenotypes[order(phenotypes$value, decreasing = T), 
+    ]
+  }
+  else if (sort.by.category.value) {
+    phenotypes = phenotypes[order(-phenotypes$groupnum, phenotypes$value, 
+                                  decreasing = T), ]
+  }
+  else {
+    phenotypes = phenotypes[order(phenotypes$groupnum, phenotypes$phenotype), 
+    ]
+  }
+  phenotypes$seq = 1:nrow(phenotypes)
+  phenotypes = phenotypes[, c("phenotype", "seq", "value")]
+  names(phenotypes)[3] = "min.value"
+  d = inner_join(phenotypes, d, by = "phenotype")
+  d = d[order(d$seq), ]
+  if (missing(max.y)) 
+    max.y = ceiling(max(d$value))
+  if (switch.axis) {
+    d = d[nrow(d):1, ]
+    d$groupnum = max(d$groupnum) - d$groupnum + 1
+    d$seq = max(d$seq) - d$seq + 1
+  }
+  if (x.group.labels) {
+    labels = dplyr::summarize(group_by(d, groupnum), tick = mean(unique(seq)), 
+                       label = as.character(group[1]))
+    labels = labels[order(labels$tick), ]
+  }
+  if (missing(color.palette)) {
+    color.palette = unique(d[order(d$seq), ]$color)
+    names(color.palette) = color.palette
+  }
+  else {
+    names(color.palette) = unique(d[order(d$seq), ]$color)
+  }
+  if (!switch.axis) {
+    plot = ggplot(d, ylab = y.axis.label, xlab = x.axis.label)
+    if (!missing(suggestive.line) && !is.na(suggestive.line)) 
+      plot = plot + geom_hline(yintercept = suggestive.line, 
+                               colour = "blue", alpha = I(1/3), size = 1)
+    if (!missing(significant.line) && !is.na(significant.line)) 
+      plot = plot + geom_hline(yintercept = significant.line, 
+                               colour = "red", alpha = I(1/3), size = 1)
+    plot = plot + aes(seq, value, size = size, colour = color)
+    if (!sizes) 
+      plot = plot + scale_size(range = c(point.size, point.size), 
+                               guide = "none")
+    plot = plot + geom_point()
+    plot = plot + scale_colour_manual(values = color.palette, 
+                                      guide = "none")
+    if (x.group.labels) {
+      plot = plot + scale_x_continuous(name = x.axis.label, 
+                                       limits = c(1, max.x), breaks = labels$tick, labels = labels$label, 
+                                       expand = c(0.01, 0))
+    }
+    else {
+      plot = plot + scale_x_continuous(name = x.axis.label, 
+                                       limits = c(1, max.x), breaks = c(-100), labels = c(""), 
+                                       expand = c(0.015, 0))
+    }
+    plot = plot + scale_y_continuous(y.axis.label, limits = c(0, 
+                                                              max.y), breaks = seq(0, max.y, y.axis.interval), 
+                                     expand = c(0, 0.2))
+    plot = plot + theme(panel.background = element_blank(), 
+                        panel.grid.minor = element_blank(), axis.text.x = element_text(size = size.x.labels, 
+                                                                                       colour = "black", angle = 50, hjust = 1, vjust = 1), 
+                        axis.text.y = element_text(size = size.y.labels, 
+                                                   colour = "black"), axis.line = element_line(colour = "black"), 
+                        axis.ticks = element_line(colour = "black"))
+  }
+  else {
+    plot = ggplot(d, xlab = y.axis.label, ylab = x.axis.label)
+    if (!missing(suggestive.line) && !is.na(suggestive.line)) 
+      plot = plot + geom_vline(xintercept = suggestive.line, 
+                               colour = "blue", alpha = I(1/3), size = 1)
+    if (!missing(significant.line) && !is.na(significant.line)) 
+      plot = plot + geom_vline(xintercept = significant.line, 
+                               colour = "red", alpha = I(1/3), size = 1)
+    plot = plot + aes(value, seq, size = size, colour = color)
+    if (!sizes) 
+      plot = plot + scale_size(range = c(point.size, point.size), 
+                               guide = "none")
+    plot = plot + geom_point()
+    plot = plot + scale_colour_manual(values = color.palette, 
+                                      guide = "none")
+    if (x.group.labels) {
+      plot = plot + scale_y_continuous(name = x.axis.label, 
+                                       limits = c(1, max.x), breaks = labels$tick, labels = labels$label, 
+                                       expand = c(0.015, 0.02))
+    }
+    else {
+      plot = plot + scale_y_continuous(name = x.axis.label, 
+                                       limits = c(0, max.x), breaks = c(-100), labels = c(""), 
+                                       expand = c(0.015, 0))
+    }
+    plot = plot + scale_x_continuous(y.axis.label, limits = c(0, 
+                                                              max.y), breaks = seq(0, max.y, y.axis.interval), 
+                                     expand = c(0, 0.2))
+    plot = plot + theme(panel.background = element_blank(), 
+                        panel.grid.minor = element_blank(), axis.text.y = element_text(size = size.x.labels, 
+                                                                                       colour = "black", hjust = 1, vjust = 0.5), axis.text.x = element_text(size = size.y.labels, 
+                                                                                                                                                             colour = "black", hjust = 0.5, vjust = 0), axis.line = element_line(colour = "black"), 
+                        axis.ticks = element_line(colour = "black"))
+  }
+  plot = plot + theme(legend.position = "none")
+  if (sizes) {
+    plot = suppressWarnings(plot + theme(legend.position = "right") + 
+                              scale_size("Size", range = c(point.size, 2 * point.size)))
+  }
+  if (direction) {
+    plot = plot + aes(shape = factor(direction), fill = color) + 
+      scale_shape("Direction", solid = TRUE) + scale_shape_manual(values = c(25, 
+                                                                             24)) + scale_fill_manual(values = color.palette, 
+                                                                                                      guide = "none")
+  }
+  if (annotate) {
+    d$annotate = F
+    if (!missing(annotate.list)) 
+      d[d$phenotype %in% annotate.list, ]$annotate = T
+    if ((!missing(annotate.level) && !is.na(annotate.level)) && 
+        (sum(d$value >= annotate.level) > 0)) 
+      d[d$value >= annotate.level, ]$annotate = T
+    if (sum(d$value != d$min.value) > 0 && annotate.only.largest) 
+      d[d$value != d$min.value, ]$annotate = F
+    if (!annotate.phenotype.description) {
+      d$description = ""
+    }
+    if (annotate.phenotype) 
+      d$description = paste(d$phenotype, ifelse(d$description == 
+                                                  "", "", paste(":", d$description)), sep = "")
+    if (annotate.snp.w.phenotype) 
+      d$description = paste(d$snp, ifelse(d$description == 
+                                            "", "", paste(":", d$description)), sep = "")
+    d$description = substr(d$description, 1, 60)
+    d$description = paste0("  ", d$description)
+    if (lc.labels) 
+      d$description = tolower(d$description)
+    if (sum(d$annotate) == 0) {
+      warning("Annotation requested, but no points met criteria")
+    }
+    else {
+      if (annotate.phenotype.description || annotate.phenotype || 
+          annotate.snp.w.phenotype) {
+        plot = plot + if (!base.labels) {
+          ggrepel::geom_text_repel(aes(label = description), 
+                                   colour = "black", data = d[d$annotate, ], 
+                                   size = annotate.size, angle = annotate.angle, max.overlaps = 15)
+        }
+        else {
+          geom_text(aes(label = description), colour = "black", 
+                    data = d[d$annotate, ], hjust = 0, size = annotate.size, 
+                    angle = annotate.angle)
+        }
+      }
+      if (annotate.snp) {
+        plot = plot + if (!base.labels) {
+          ggrepel::geom_text_repel(aes(label = snp), 
+                                   colour = "black", data = d[d$annotate, ], 
+                                   size = annotate.size, angle = annotate.snp.angle, max.overlaps = 15)
+        }
+        else {
+          geom_text(aes(label = snp), colour = "black", 
+                    data = d[d$annotate, ], hjust = 0, size = annotate.size, 
+                    angle = annotate.snp.angle)
+        }
+      }
+    }
+  }
+  plot = plot + labs(title = title) + theme(title = element_text(size = 12))
+  plot = plot + geom_hline(yintercept = significant.line,
+                           colour = "red", alpha = 0.5, size = 1)
+  plot 
+}
+```
+
+```{r}
+##############################################################################################
+#                                (All Participants)                                          #
+##############################################################################################
+
+##############################################################################################
+#                                     Read in Data                                           #
+##############################################################################################
+# AoU data
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string")
+
+person_condition_df_phecode_phenotype$zip <- sub("^.*([0-9]{3}).*", "\\1", person_condition_df_phecode_phenotype$value_as_string)
+# Remove rows with invalid zip (000)
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[-which(person_condition_df_phecode_phenotype$zip %in% "000"), ]
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
+# Code sex as male, female, or other to match with CTgov 
+person_condition_df_phecode_phenotype$sex_at_birth_concept_id[which(!(person_condition_df_phecode_phenotype$sex_at_birth_concept_id %in% c(45880669, 45878463)))] <- 9999999999
+person_condition_df_phecode_phenotype$zip <- as.factor(person_condition_df_phecode_phenotype$zip)
+
+tab1_tab2_tab3 <- data_fun(person_condition_df_phecode_phenotype)
+unique_Phecode <- unique(person_condition_df_phecode_phenotype$Phecode)
+cores <- detectCores()
+cl <- makeCluster(8)
+registerDoParallel(cl)
+
+Trial_Eligibility_PheWAS <- foreach(i = 1:length(unique_Phecode), .combine = rbind, .packages = c("dplyr", "MASS")) %dopar% {
+    temp <- nb_fun(data = tab1_tab2_tab3, Phecode_cur = unique_Phecode[i])
+    temp_df <- as.data.frame(t(temp))
+    temp_df$Phecode <- unique_Phecode[i]
+    temp_df
+}
+stopCluster(cl)
+
+# Bonferroni adjustment
+numTest <- nrow(Trial_Eligibility_PheWAS)
+corrected_p <- 0.05/numTest
+Trial_Eligibility_PheWAS$OR <- exp(Trial_Eligibility_PheWAS$Estimate)
+# The first column is not really the OR but the RR (labeling it as OR makes it compatible with PheWAS package)
+names(Trial_Eligibility_PheWAS) <- c("Estimate", "SE", "z", "p", "phenotype", "OR")
+
+Trial_Eligibility_PheWAS$phenotype <- as.character(Trial_Eligibility_PheWAS$phenotype)
+Trial_Eligibility_PheWAS[which(nchar(Trial_Eligibility_PheWAS$phenotype) < 3), ]$phenotype <- str_pad(Trial_Eligibility_PheWAS[which(nchar(Trial_Eligibility_PheWAS$phenotype) < 3), ]$phenotype, 3, pad = "0")
+# jpeg("AoU_PheWAS_Overall_Top20_New.jpeg", units = "in", width = 10, height = 8, res = 300)
+phewasManhattan_mod(Trial_Eligibility_PheWAS[, c("phenotype", "p", "OR")], 
+                    title = "", 
+                    significant.line = corrected_p, suggestive.line = corrected_p, y.axis.interval = 100,
+                    annotate.size = 3.5, OR.direction = FALSE, OR.size = FALSE, point.size = 3, max.y = 330,
+                    annotate.level = 9e-98)
+# dev.off()
+View(Trial_Eligibility_PheWAS[order(Trial_Eligibility_PheWAS$p), ])
+check_Overall <- addPhecodeInfo(Trial_Eligibility_PheWAS[which(Trial_Eligibility_PheWAS$p < corrected_p), ]); nrow(check_Overall)
+check_Overall <- check_Overall[order(check_Overall$OR, decreasing = TRUE), ]
+check_Overall$description <- factor(check_Overall$description, levels = check_Overall$description)
+check_Overall$lower <- exp(check_Overall$Estimate - 1.96 * check_Overall$SE)
+check_Overall$upper <- exp(check_Overall$Estimate + 1.96 * check_Overall$SE)
+View(check_Overall[order(check_Overall$p), ])
+top20 <- check_Overall[order(check_Overall$p), ]
+top20 <- top20[1:20, ]
+View(top20[order(top20$OR, decreasing = TRUE), ])
+```
