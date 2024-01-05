@@ -1,4 +1,4 @@
-# Social Determinants of Health and Clinical Trial Opportunities in the All of Us Research Program
+# Increasing Clinical Trial Diversity: Insights on Opportunities and Barriers from the All of Us Data
 
 This Github Repository contains the following files:
 
