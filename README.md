@@ -1,4 +1,4 @@
-# Increasing Clinical Trial Diversity: Insights on Opportunities and Barriers from the All of Us Data
+# Illuminating the Landscape of High-Level Clinical Trial Opportunities in the All of Us Research Program
 
 This Github Repository contains the following files:
 
