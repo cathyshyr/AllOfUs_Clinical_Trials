@@ -16,13 +16,15 @@ library(tidyr)
 library(stringr)
 library(plotly)
 library(MASS)
-library(Hmisc)
-library(splitstackshape)
-library(doMC)
 library(foreach)
 library(doParallel)
 library(dplyr)
+library(parallel)
 library(PheWAS)
+library(ggridges)
+library(ggdist)
+library(DescTools)
+library(forcats)
 ```
 
 ```{r}
@@ -475,58 +477,1118 @@ trial_dat_expanded_NIH <- trial_dat_expanded[which(trial_dat_expanded$NCTId %in%
 trial_dat_expanded_zip_NIH <- trial_dat_expanded_zip[which(trial_dat_expanded_zip$NCTId %in% NIH_NCTId), ]
 write.csv(trial_dat_expanded_NIH, file = "trial_dat_expanded_NIH.csv")
 write.csv(trial_dat_expanded_zip_NIH, file = "trial_dat_expanded_zip_NIH.csv")
+
+##############################################################
+#        Subset expanded datasets to industry studies        #
+##############################################################
+trial_dat_expanded_IND <- trial_dat_expanded[which(trial_dat_expanded$NCTId %in% IND_NCTId), ]
+trial_dat_expanded_zip_IND <- trial_dat_expanded_zip[which(trial_dat_expanded_zip$NCTId %in% IND_NCTId), ]
+write.csv(trial_dat_expanded_IND, file = "trial_dat_expanded_IND.csv")
+write.csv(trial_dat_expanded_zip_IND, file = "trial_dat_expanded_zip_IND.csv")
+
+
+##############################################################
+#        Subset expanded datasets to academic studies        #
+##############################################################
+trial_dat_expanded_OTH <- trial_dat_expanded[which(trial_dat_expanded$NCTId %in% OTH_NCTId), ]
+trial_dat_expanded_zip_OTH <- trial_dat_expanded_zip[which(trial_dat_expanded_zip$NCTId %in% OTH_NCTId), ]
+write.csv(trial_dat_expanded_OTH, file = "trial_dat_expanded_OTH.csv")
+write.csv(trial_dat_expanded_zip_OTH, file = "trial_dat_expanded_zip_OTH.csv")
+
 ```
 
 ```{r, Match Participants with Trials}
 ####################################################################################################
-#                              Match Based on Age, Sex and Zip For Trials Only                     #
+#                              Match Based on Age and Sex For Trials Only                          #
 ####################################################################################################
 ##############################################################################################
 #                                     Read in Data                                           #
 ##############################################################################################
 # AoU data
 person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
-person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string")]
-names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string")
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode")
+
+# Code sex as male, female, or other to match with CTgov 
+person_condition_df_phecode_phenotype$sex_at_birth_concept_id[which(!(person_condition_df_phecode_phenotype$sex_at_birth_concept_id %in% c(45880669, 45878463)))] <- 9999999999
+# alloc.col(person_condition_df)
+
+# CTgov data
+# Even though this is matching without zip, just use the set where trials have at least 1 valid U.S.-based location
+trial_dat_expanded <- as.data.table(fread("trial_dat_expanded.csv", header = TRUE))
+trial_dat_expanded <- trial_dat_expanded[, -1]
+trial_dat_expanded <- trial_dat_expanded[which(trial_dat_expanded$StudyType %in% "Interventional"), ]
+trial_dat_expanded <- trial_dat_expanded[, c("StudyType"):= NULL]
+trial_dat_expanded$MinimumAge <- as.double(trial_dat_expanded$MinimumAge)
+trial_dat_expanded$Gender <- as.double(trial_dat_expanded$Gender)
+names(trial_dat_expanded) <- c("NCTId", "sex_at_birth_concept_id", "MinimumAge", "MaximumAge", "Phecode")
+
+
+####################################################################################################
+#                              Match Based on Age and Sex                                          #
+####################################################################################################
+# For each participant, count the number of studies s/he is eligible for
+AoU_to_CTgov_Trial <- trial_dat_expanded[person_condition_df_phecode_phenotype, on = c("Phecode", "sex_at_birth_concept_id", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_Trial$person_id <- person_condition_df_phecode_phenotype$person_id
+AoU_to_CTgov_Trial_ReturnOfValue <- AoU_to_CTgov_Trial
+AoU_to_CTgov_Trial_ReturnOfValue <- AoU_to_CTgov_Trial_ReturnOfValue[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_Trial <- AoU_to_CTgov_Trial[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_Trial, file = "AoU_to_CTgov_Trial.csv")
+AoU_to_CTgov_Trial <- AoU_to_CTgov_Trial[order(AoU_to_CTgov_Trial$nMatch, decreasing = TRUE), ]
+# barplot(AoU_to_CTgov_Trial$nMatch, xlab = "Participant", ylab = "Number of Eligible Trials", main = "Number of Eligible Trials by Participant", ylim = c(0, 20000))
+AoU_to_CTgov_Trial$category <- ifelse(AoU_to_CTgov_Trial$nMatch == 0, 0, 
+                                         ifelse(AoU_to_CTgov_Trial$nMatch <= 500, 1, 
+                                                ifelse(AoU_to_CTgov_Trial$nMatch <= 1000, 2, 3)))
+
+# table(AoU_to_CTgov_Trial$category)
+
+# For each trial, count the number of eligible participants
+CTgov_to_AoU_Trial <- person_condition_df_phecode_phenotype[trial_dat_expanded, on = c("Phecode", "sex_at_birth_concept_id", "age_in_years <= MaximumAge", "age_in_years >= MinimumAge"), .(list(person_id)), by = .EACHI]
+CTgov_to_AoU_Trial$NCTId <- trial_dat_expanded$NCTId
+CTgov_to_AoU_Trial_ReturnOfValue <- CTgov_to_AoU_Trial
+CTgov_to_AoU_Trial_ReturnOfValue <- CTgov_to_AoU_Trial_ReturnOfValue[, c("NCTId", "V1", "Phecode")]
+CTgov_to_AoU_Trial <- CTgov_to_AoU_Trial[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(NCTId)]
+write.csv(CTgov_to_AoU_Trial, file = "CTgov_to_AoU_Trial.csv")
+CTgov_to_AoU_Trial <- CTgov_to_AoU_Trial[order(CTgov_to_AoU_Trial$nMatch, decreasing = TRUE), ]
+# barplot(CTgov_to_AoU_Trial$nMatch, xlab = "Study", ylab = "Number of Eligible Participants", main = "Number of Eligible Participants by Trial", ylim = c(0, 200000))
+CTgov_to_AoU_Trial$category <- ifelse(CTgov_to_AoU_Trial$nMatch == 0, 0, 
+                                ifelse(CTgov_to_AoU_Trial$nMatch <= 500, 1, 
+                                       ifelse(CTgov_to_AoU_Trial$nMatch <= 1000, 2, 3)))
+# table(CTgov_to_AoU_Trial$category)
+```
+
+```{r}
+################################################################################
+#                                 2023/09/20 update                            #
+################################################################################
+
+####################################################################################################
+#                                            Table 1                                               #
+####################################################################################################
+##############################################################################################
+#                                 (Add Race/Ethnicity)                                       #
+##############################################################################################
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string", "race_concept_id", "ethnicity_concept_id")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string", "race", "ethnicity")
 
 person_condition_df_phecode_phenotype$zip <- sub("^.*([0-9]{3}).*", "\\1", person_condition_df_phecode_phenotype$value_as_string)
 # Remove rows with invalid zip (000)
 person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[-which(person_condition_df_phecode_phenotype$zip %in% "000"), ]
-person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-# Code sex as male, female, or other to match with CTgov 
-person_condition_df_phecode_phenotype$sex_at_birth_concept_id[which(!(person_condition_df_phecode_phenotype$sex_at_birth_concept_id %in% c(45880669, 45878463)))] <- 9999999999
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip", "race", "ethnicity")]
+person_condition_df_phecode_phenotype$race_ethnicity <- ifelse(person_condition_df_phecode_phenotype$race == 8527 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "White",
+                                                              ifelse(person_condition_df_phecode_phenotype$race == 8516 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Black",
+                                                                    ifelse(person_condition_df_phecode_phenotype$race == 8515 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Asian",
+                                                                          ifelse(person_condition_df_phecode_phenotype$race == 8557 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "NHOPI",
+                                                                                ifelse(person_condition_df_phecode_phenotype$race == 38003615 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "MENA",
+                                                                                       ifelse(person_condition_df_phecode_phenotype$race == 2000000008 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Multiple",
+                                                                                              ifelse(person_condition_df_phecode_phenotype$ethnicity == 38003563, "Hispanic", "Other")))))))
+person_condition_df_phecode_phenotype$sex_at_birth <- ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id  == 45878463, "Female",
+                                                            ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 45880669, "Male",
+                                                                  ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 903096, "NoAnswer",
+                                                                        ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 0, "NoAnswer",
+                                                                              ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 46273637, "Intersex",
+                                                                                    ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 4124462, "None", "NoAnswer"))))))
+
+
+##############################################################################################
+#                                    (Add # of Conditions)                                   #
+##############################################################################################
+person_Cond <- as.data.table(person_condition_df_phecode_phenotype[, c("person_id", "Phecode")]) %>% distinct()
+person_nCond <- as.data.table(person_Cond %>% group_by(person_id) %>% summarise(n_condition = n_distinct(Phecode)))
+
+##############################################################################################
+#                                    (Add Age Category)                                      #
+##############################################################################################
+person_condition_df_phecode_phenotype$age_cat <- ifelse(person_condition_df_phecode_phenotype$age_in_years < 50, 1, 2)
+person_condition_df_phecode_phenotype$age_cat <- as.factor(person_condition_df_phecode_phenotype$age_cat)
+
+##############################################################################################
+#                                    (Add Location)                                          #
+##############################################################################################
+zip3_wRUCC <-  as.data.table(fread("zip3_wRUCC.csv", header = TRUE))
+zip3_wRUCC <- zip3_wRUCC[, -1]
+zip3_wRUCC$ZIP3 <- str_pad(zip3_wRUCC$ZIP3, 3, pad = "0")
+zip3_wRUCC <- zip3_wRUCC[, c("ZIP3", "wRUCC")]
+names(zip3_wRUCC) <- c("zip", "wRUCC")
+person_condition_df_phecode_phenotype$zip <- as.factor(person_condition_df_phecode_phenotype$zip)
+person_condition_df_phecode_phenotype <- zip3_wRUCC[person_condition_df_phecode_phenotype, on = "zip"]
+person_condition_df_phecode_phenotype$location <- ifelse(person_condition_df_phecode_phenotype$wRUCC < 3, "Metro", "NonMetro")
+
+##############################################################################################
+#                                     (Survey Data)                                          #
+##############################################################################################
+# question_id <- c(1585940, 1585375, 1585889)
+question_id <- c(1585940, 903573, 903574, 903575, 903576, 903577, 903578, 1585375, 1585889)
+question_id_collapse <- paste0(question_id, collapse = ",")
+survey_query <- str_glue("SELECT 
+                              answer,
+                              question_concept_id,
+                              person_id,
+                              survey_datetime
+                          FROM 
+                              `{dataset}.ds_survey` ds_survey 
+                          WHERE 
+                              ds_survey.question_concept_id IN ({question_id_collapse})")
+survey_data <- download_data(survey_query)
+survey_data$year <- format(as.Date(survey_data$survey_datetime, format="%d/%m/%Y"),"%Y")
+
+
+
+#############
+# Education #
+#############
+# 1585940 What is the highest grade or year of school you completed?
+survey_education <- survey_data[which(survey_data$question_concept_id == 1585940), ]
+survey_education$education <- ifelse(survey_education$answer %in% c("Highest Grade: Never Attended", "Highest Grade: One Through Four", "Highest Grade: Five Through Eight", "Highest Grade: Nine Through Eleven"), "Eleven or below",
+                                    ifelse(survey_education$answer %in% c("Highest Grade: Twelve Or GED", "Highest Grade: College One to Three"), "Twelve or GED", 
+                                           ifelse(survey_education$answer %in% c("Highest Grade: College Graduate"), "College Graduate", 
+                                                 ifelse(survey_education$answer %in% c("Highest Grade: Advanced Degree"), "Advanced Degree", "NoAnswer"))))
+survey_education <- survey_education[, c("person_id", "education")]
+survey_education <- as.data.table(survey_education)
+survey_education <- survey_education[which(survey_education$education %in% c("Eleven or below", "Twelve or GED", "College Graduate", "Advanced Degree"))]
+survey_education <- survey_education %>% distinct()
+
+##############
+#   Income   #
+##############
+# 1585375 What is your annual household income from all sources?
+# 1585889 Not including yourself, how many other people live at home with you?
+survey_income <- survey_data[which(survey_data$question_concept_id == 1585375), ]
+survey_income <- survey_income[, c("person_id", "answer", "year")]
+survey_income$max_income <- ifelse(survey_income$answer %in% c("Annual Income: 10k 25k"), 25000,
+                                  ifelse(survey_income$answer %in% c("Annual Income: 25k 35k"), 35000,
+                                        ifelse(survey_income$answer %in% c("Annual Income: 35k 50k"), 50000,
+                                              ifelse(survey_income$answer %in% c("Annual Income: 50k 75k"), 75000,
+                                                    ifelse(survey_income$answer %in% c("Annual Income: 75k 100k"), 100000,
+                                                          ifelse(survey_income$answer %in% c("Annual Income: 100k 150k"), 150000,
+                                                                ifelse(survey_income$answer %in% c("Annual Income: 150k 200k"), 200000,
+                                                                      ifelse(survey_income$answer %in% c("Annual Income: more 200k"), 200001,
+                                                                            ifelse(survey_income$answer %in% c("Annual Income: less 10k"), 9999, "NoAnswer")))))))))
+survey_income <- survey_income[, c("person_id", "max_income", "year")]
+survey_income <- as.data.table(survey_income)
+survey_income_mostRecent <- survey_income %>%
+  group_by(person_id) %>%
+  filter(year == max(year))
+survey_income_mostRecent <- as.data.table(survey_income_mostRecent)
+survey_size <- survey_data[which(survey_data$question_concept_id == 1585889), ]
+survey_size$family_size <- ifelse(survey_size$answer %in% "0", 1, 
+                                  ifelse(survey_size$answer %in% "1", 2, 
+                                        ifelse(survey_size$answer %in% "2", 3, 
+                                              ifelse(survey_size$answer %in% "3", 4,
+                                                    ifelse(survey_size$answer %in% "4", 5,
+                                                          ifelse(survey_size$answer %in% "5", 6,
+                                                                ifelse(survey_size$answer %in% "6", 7,
+                                                                      ifelse(survey_size$answer %in% "7", 8,
+                                                                            ifelse(survey_size$answer %in% "8", 9,
+                                                                                  ifelse(survey_size$answer %in% "9", 10,
+                                                                                        ifelse(survey_size$answer %in% "10", 11, "NoAnswer")))))))))))
+survey_size <- survey_size[, c("person_id", "family_size")]
+survey_size <- survey_size %>% distinct()
+survey_size <- as.data.table(survey_size)
+person_id_zip <- person_condition_df_phecode_phenotype[, c("person_id", "zip")]
+person_id_zip <- person_id_zip %>% distinct()
+survey_size_zip <- person_id_zip[survey_size, on = "person_id"]
+survey_size_zip_income <- survey_income[survey_size_zip, on = "person_id"]
+
+income_zip_family_size <- fread("income_zip_long_new.csv", header = TRUE)
+income_zip_family_size <- income_zip_family_size[, -1]
+income_zip_family_size$zip <- as.character(income_zip_family_size$zip)
+income_zip_family_size$year <- as.character(income_zip_family_size$year)
+
+survey_size_zip_income_limit <- income_zip_family_size[survey_size_zip_income, on = c("family_size", "zip", "year")]
+survey_size_zip_income_limit <- survey_size_zip_income_limit[-which(survey_size_zip_income_limit$max_income %in% "NoAnswer"), ]
+survey_size_zip_income_limit <- survey_size_zip_income_limit[-which(is.na(survey_size_zip_income_limit$zip)), ]
+survey_size_zip_income_limit$max_income <- as.double(survey_size_zip_income_limit$max_income)
+survey_size_zip_income_limit$low_income <- ifelse(survey_size_zip_income_limit$max_income < survey_size_zip_income_limit$income_limit, "Yes", "No")
+
+survey_low_income <- survey_size_zip_income_limit[, c("person_id", "low_income")]
+survey_low_income <- as.data.table(survey_low_income)
+survey_low_income <- survey_low_income %>% distinct()
+
+##############
+# Disability #
+##############
+# 903573 Are you deaf or do you have serious difficulty hearing?
+# 903574 Are you blind or do you have serious difficulty seeing, even when wearing glasses?
+# 903575 Because of a physical, mental, or emotional condition, do you have serious difficulty concentrating, remembering or making decisions?
+# 903576 Do you have serious difficulty walking or climbing stairs?
+# 903577 Do you have difficulty dressing or bathing?
+# 903578 Because of a physical, mental, or emotional condition, do you have difficulty doing errands alone such as visiting doctorвЂ™s office or shopping?
+survey_disability <- survey_data[which(survey_data$question_concept_id %in% c(903573, 903574, 903575, 903576, 903577, 903578)), ]
+survey_disability$disability <- ifelse(survey_disability$answer %in% c("Deaf: Yes", "Blind: Yes", "Errands Alone: Yes",
+                                                                       "Dressing Bathing: Yes", "Walking Climbing: Yes", 
+                                                                       "Difficulty Concentrating: Yes"), "Yes",
+                                      ifelse(survey_disability$answer %in% c("Deaf: No", "Blind: No", "Errands Alone: No",
+                                                                       "Dressing Bathing: No", "Walking Climbing: No", 
+                                                                       "Difficulty Concentrating: No"), "No", "NoAnswer"))
+
+survey_disability <- survey_disability[, c("person_id", "disability")]
+survey_disability <- survey_disability %>% dplyr::group_by(person_id) %>% dplyr::mutate(any_disability = ifelse(any(disability %in% "Yes"), "Yes", disability))
+survey_disability <- survey_disability[, c("person_id", "any_disability")]
+survey_disability <- as.data.table(survey_disability)
+survey_disability <- survey_disability %>% distinct()
+
+# Merge all data together
+person_table1 <- person_condition_df_phecode_phenotype[, c("person_id", "location", "age_cat", "race_ethnicity", "sex_at_birth")]
+person_table1 <- survey_education[person_table1, on = "person_id"]
+person_table1 <- survey_low_income[person_table1, on = "person_id"]
+person_table1 <- survey_disability[person_table1, on = "person_id"]
+person_table1 <- person_table1 %>% distinct()
+person_table1 <- as.data.table(person_table1)
+
+person_figure2 <- person_condition_df_phecode_phenotype[, c("person_id", "location", "age_in_years", "race_ethnicity", "sex_at_birth")]
+person_figure2 <- person_figure2[which(person_figure2$sex_at_birth %in% c("Female", "Male", "Intersex")), ]
+person_figure2 <- survey_education[person_figure2, on = "person_id"]
+person_figure2 <- survey_low_income[person_figure2, on = "person_id"]
+person_figure2 <- person_nCond[person_figure2, on = "person_id"]
+person_figure2 <- person_figure2 %>% distinct()
+person_figure2 <- as.data.table(person_figure2)
+
+write.csv(person_table1, file = "person_table1.csv")
+write.csv(person_figure2, file = "person_figure2.csv")
+```
+
+```{r}
+################################################################################
+#                                 2024/02/20 update                            #
+#                           Add clinical profiles to Table 1                   #
+################################################################################
+
+# AoU data
+person_condition_df_phecode_phenotype <- as.data.table(fread("person_condition_df_phecode_phenotype.csv", header = TRUE))
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[, c("person_id", "sex_at_birth_concept_id", "age_in_years", "PheCode", "value_as_string", "race_concept_id", "ethnicity_concept_id")]
+names(person_condition_df_phecode_phenotype) <- c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "value_as_string", "race", "ethnicity")
+
+person_condition_df_phecode_phenotype$zip <- sub("^.*([0-9]{3}).*", "\\1", person_condition_df_phecode_phenotype$value_as_string)
+# Remove rows with invalid zip (000)
+person_condition_df_phecode_phenotype <- person_condition_df_phecode_phenotype[-which(person_condition_df_phecode_phenotype$zip %in% "000"), ]
+##############################################################################################
+#                                             (Add R/E)                                      #
+##############################################################################################
+person_condition_df_phecode_phenotype$race_ethnicity <- ifelse(person_condition_df_phecode_phenotype$race == 8527 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "White",
+                                                              ifelse(person_condition_df_phecode_phenotype$race == 8516 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Black",
+                                                                    ifelse(person_condition_df_phecode_phenotype$race == 8515 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Asian",
+                                                                          ifelse(person_condition_df_phecode_phenotype$race == 8557 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "NHOPI",
+                                                                                ifelse(person_condition_df_phecode_phenotype$race == 38003615 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "MENA",
+                                                                                       ifelse(person_condition_df_phecode_phenotype$race == 2000000008 & person_condition_df_phecode_phenotype$ethnicity == 38003564, "Multiple",
+                                                                                              ifelse(person_condition_df_phecode_phenotype$ethnicity == 38003563, "Hispanic", "Other")))))))
+##############################################################################################
+#                                    (Add Sex Category)                                      #
+##############################################################################################
+person_condition_df_phecode_phenotype$sex_at_birth <- ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id  == 45878463, "Female",
+                                                            ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 45880669, "Male",
+                                                                  ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 903096, "NoAnswer",
+                                                                        ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 0, "NoAnswer",
+                                                                              ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 46273637, "Intersex",
+                                                                                    ifelse(person_condition_df_phecode_phenotype$sex_at_birth_concept_id == 4124462, "None", "NoAnswer"))))))
+
+
+##############################################################################################
+#                                    (Add Age Category)                                      #
+##############################################################################################
+person_condition_df_phecode_phenotype$age_cat <- ifelse(person_condition_df_phecode_phenotype$age_in_years < 40, 1,
+                                                        ifelse(person_condition_df_phecode_phenotype$age_in_years < 70, 2, 3))
+person_condition_df_phecode_phenotype$age_cat <- as.factor(person_condition_df_phecode_phenotype$age_cat)
+
+##############################################################################################
+#                                    (Add Location)                                          #
+##############################################################################################
+zip3_wRUCC <-  as.data.table(fread("zip3_wRUCC.csv", header = TRUE))
+zip3_wRUCC <- zip3_wRUCC[, -1]
+zip3_wRUCC$ZIP3 <- str_pad(zip3_wRUCC$ZIP3, 3, pad = "0")
+zip3_wRUCC <- zip3_wRUCC[, c("ZIP3", "wRUCC")]
+names(zip3_wRUCC) <- c("zip", "wRUCC")
+
+# Merge AoU data with zip3-to-RUCC key
+person_condition_df_phecode_phenotype$zip <- as.factor(person_condition_df_phecode_phenotype$zip)
+person_condition_df_phecode_phenotype <- zip3_wRUCC[person_condition_df_phecode_phenotype, on = "zip"]
+person_condition_df_phecode_phenotype$location <- ifelse(person_condition_df_phecode_phenotype$wRUCC < 3, "Metro", "NonMetro")
+
 person_condition_df_phecode_phenotype$Phecode <- as.character(person_condition_df_phecode_phenotype$Phecode)
 person_condition_df_phecode_phenotype_category <- addPhecodeInfo(person_condition_df_phecode_phenotype)
-person_condition_df_phecode_phenotype_category$group[which(person_condition_df_phecode_phenotype_category$group %in% c("digestive", "hematopoietic", "sense organs", "symptoms", "musculoskeletal", "genitourinary", "injuries & poisonings", "pregnancy complications", "dermatologic", "congenital anomalies"))] <- "other"
+table1_cond <- person_condition_df_phecode_phenotype_category %>%
+                    group_by(group) %>%
+                    summarise(unique_persons = n_distinct(person_id))
+table1_cond$prop <- table1_cond$unique_persons/length(unique(person_condition_df_phecode_phenotype_category$person_id))
+table1_cond
 
-# endocrine/metabolic
-person_condition_df_phecode_phenotype_em <- person_condition_df_phecode_phenotype_category[which(person_condition_df_phecode_phenotype_category$group %in% "endocrine/metabolic"), c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-# neoplasms
-person_condition_df_phecode_phenotype_neoplasms <- person_condition_df_phecode_phenotype_category[which(person_condition_df_phecode_phenotype_category$group %in% "neoplasms"), c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-# mental
-person_condition_df_phecode_phenotype_mental <- person_condition_df_phecode_phenotype_category[which(person_condition_df_phecode_phenotype_category$group %in% "mental disorders"), c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-# respiratory
-person_condition_df_phecode_phenotype_respiratory <- person_condition_df_phecode_phenotype_category[which(person_condition_df_phecode_phenotype_category$group %in% "respiratory"), c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-# circulatory 
-person_condition_df_phecode_phenotype_circulatory <- person_condition_df_phecode_phenotype_category[which(person_condition_df_phecode_phenotype_category$group %in% "circulatory system"), c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-# neurological 
-person_condition_df_phecode_phenotype_neurological <- person_condition_df_phecode_phenotype_category[which(person_condition_df_phecode_phenotype_category$group %in% "neurological"), c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-# infectious 
-person_condition_df_phecode_phenotype_infectious <- person_condition_df_phecode_phenotype_category[which(person_condition_df_phecode_phenotype_category$group %in% "infectious diseases"), c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-# Other
-person_condition_df_phecode_phenotype_other <- person_condition_df_phecode_phenotype_category[which(person_condition_df_phecode_phenotype_category$group %in% "other"), c("person_id", "sex_at_birth_concept_id", "age_in_years", "Phecode", "zip")]
-
-# CTgov data
-trial_dat_expanded_zip <- as.data.table(fread("trial_dat_expanded_zip.csv", header = TRUE))
-trial_dat_expanded_zip <- trial_dat_expanded_zip[, -1]
-trial_dat_expanded_zip <- trial_dat_expanded_zip[which(trial_dat_expanded_zip$StudyType %in% "Interventional"), ]
-trial_dat_expanded_zip <- trial_dat_expanded_zip[, c("StudyType"):= NULL]
-trial_dat_expanded_zip$MinimumAge <- as.double(trial_dat_expanded_zip$MinimumAge)
-trial_dat_expanded_zip$Gender <- as.double(trial_dat_expanded_zip$Gender)
-trial_dat_expanded_zip$Zip <- sprintf("%03d", as.numeric(trial_dat_expanded_zip$Zip))
-trial_dat_expanded_zip$Phecode <- as.character(trial_dat_expanded_zip$Phecode)
-names(trial_dat_expanded_zip) <- c("NCTId", "sex_at_birth_concept_id", "MinimumAge", "MaximumAge", "zip", "Phecode")
+# person_condition_df_phecode_phenotype_category$group[which(person_condition_df_phecode_phenotype_category$group %in% c("digestive", "hematopoietic", "sense organs", "symptoms", "musculoskeletal", "genitourinary", "injuries & poisonings", "pregnancy complications", "dermatologic", "congenital anomalies", "infectious diseases"))] <- "other"
+person_condition_df_phecode_phenotype_category$group[which(!(person_condition_df_phecode_phenotype_category$group %in% c("endocrine/metabolic", "neoplasms", "mental disorders", "respiratory", "circulatory system", "neurological")))] <- "other"
+table1_cond <- person_condition_df_phecode_phenotype_category %>%
+                    group_by(group) %>%
+                    summarise(unique_persons = n_distinct(person_id))
+table1_cond$prop <- table1_cond$unique_persons/length(unique(person_condition_df_phecode_phenotype_category$person_id))
+table1_cond
 ```
+
+```{r}
+################################################################################
+#                                 2023/09/20 update                            #
+################################################################################
+
+
+#########################################
+#                Overall                #
+#########################################
+AoU_to_CTgov_wZip_Trial_overall <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype_category, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_overall$person_id <- person_condition_df_phecode_phenotype_category$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_overall <- AoU_to_CTgov_wZip_Trial_overall
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_overall <- AoU_to_CTgov_wZip_Trial_ReturnOfValue_overall[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial_overall <- AoU_to_CTgov_wZip_Trial_overall[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial_overall, file = "AoU_to_CTgov_wZip_Trial_overall.csv")
+AoU_to_CTgov_wZip_Trial_overall <- AoU_to_CTgov_wZip_Trial_overall[order(AoU_to_CTgov_wZip_Trial_overall$nMatch, decreasing = TRUE), ]
+
+
+#########################################
+#                Other                  #
+#########################################
+# For each participant, count the number of studies s/he matches with
+AoU_to_CTgov_wZip_Trial_other <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype_other, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_other$person_id <- person_condition_df_phecode_phenotype_other$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_other <- AoU_to_CTgov_wZip_Trial_other
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_other <- AoU_to_CTgov_wZip_Trial_ReturnOfValue_other[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial_other <- AoU_to_CTgov_wZip_Trial_other[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial_other, file = "AoU_to_CTgov_wZip_Trial_other.csv")
+AoU_to_CTgov_wZip_Trial_other <- AoU_to_CTgov_wZip_Trial_other[order(AoU_to_CTgov_wZip_Trial_other$nMatch, decreasing = TRUE), ]
+
+#########################################
+#                neurological           #
+#########################################
+# For each participant, count the number of studies s/he matches with
+AoU_to_CTgov_wZip_Trial_neurological <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype_neurological, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_neurological$person_id <- person_condition_df_phecode_phenotype_neurological$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_neurological <- AoU_to_CTgov_wZip_Trial_neurological
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_neurological <- AoU_to_CTgov_wZip_Trial_ReturnOfValue_neurological[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial_neurological <- AoU_to_CTgov_wZip_Trial_neurological[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial_neurological, file = "AoU_to_CTgov_wZip_Trial_neurological.csv")
+AoU_to_CTgov_wZip_Trial_neurological <- AoU_to_CTgov_wZip_Trial_neurological[order(AoU_to_CTgov_wZip_Trial_neurological$nMatch, decreasing = TRUE), ]
+
+#########################################
+#                circulatory            #
+#########################################
+# For each participant, count the number of studies s/he matches with
+AoU_to_CTgov_wZip_Trial_circulatory <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype_circulatory, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_circulatory$person_id <- person_condition_df_phecode_phenotype_circulatory$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_circulatory <- AoU_to_CTgov_wZip_Trial_circulatory
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_circulatory <- AoU_to_CTgov_wZip_Trial_ReturnOfValue_circulatory[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial_circulatory <- AoU_to_CTgov_wZip_Trial_circulatory[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial_circulatory, file = "AoU_to_CTgov_wZip_Trial_circulatory.csv")
+AoU_to_CTgov_wZip_Trial_circulatory <- AoU_to_CTgov_wZip_Trial_circulatory[order(AoU_to_CTgov_wZip_Trial_circulatory$nMatch, decreasing = TRUE), ]
+
+#########################################
+#                respiratory            #
+#########################################
+# For each participant, count the number of studies s/he matches with
+AoU_to_CTgov_wZip_Trial_respiratory <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype_respiratory, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_respiratory$person_id <- person_condition_df_phecode_phenotype_respiratory$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_respiratory <- AoU_to_CTgov_wZip_Trial_respiratory
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_respiratory <- AoU_to_CTgov_wZip_Trial_ReturnOfValue_respiratory[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial_respiratory <- AoU_to_CTgov_wZip_Trial_respiratory[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial_respiratory, file = "AoU_to_CTgov_wZip_Trial_respiratory.csv")
+AoU_to_CTgov_wZip_Trial_respiratory <- AoU_to_CTgov_wZip_Trial_respiratory[order(AoU_to_CTgov_wZip_Trial_respiratory$nMatch, decreasing = TRUE), ]
+
+#########################################
+#                mental                 #
+#########################################
+# For each participant, count the number of studies s/he matches with
+AoU_to_CTgov_wZip_Trial_mental <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype_mental, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_mental$person_id <- person_condition_df_phecode_phenotype_mental$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_mental <- AoU_to_CTgov_wZip_Trial_mental
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_mental <- AoU_to_CTgov_wZip_Trial_ReturnOfValue_mental[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial_mental <- AoU_to_CTgov_wZip_Trial_mental[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial_mental, file = "AoU_to_CTgov_wZip_Trial_mental.csv")
+AoU_to_CTgov_wZip_Trial_mental <- AoU_to_CTgov_wZip_Trial_mental[order(AoU_to_CTgov_wZip_Trial_mental$nMatch, decreasing = TRUE), ]
+
+#########################################
+#                neoplasms              #
+#########################################
+# For each participant, count the number of studies s/he matches with
+AoU_to_CTgov_wZip_Trial_neoplasms <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype_neoplasms, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_neoplasms$person_id <- person_condition_df_phecode_phenotype_neoplasms$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_neoplasms <- AoU_to_CTgov_wZip_Trial_neoplasms
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_neoplasms <- AoU_to_CTgov_wZip_Trial_ReturnOfValue_neoplasms[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial_neoplasms <- AoU_to_CTgov_wZip_Trial_neoplasms[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial_neoplasms, file = "AoU_to_CTgov_wZip_Trial_neoplasms.csv")
+AoU_to_CTgov_wZip_Trial_neoplasms <- AoU_to_CTgov_wZip_Trial_neoplasms[order(AoU_to_CTgov_wZip_Trial_neoplasms$nMatch, decreasing = TRUE), ]
+
+############################################
+#              endocrine/metabolic         #
+############################################
+# For each participant, count the number of studies s/he matches with
+AoU_to_CTgov_wZip_Trial_em <- trial_dat_expanded_zip[person_condition_df_phecode_phenotype_em, on = c("Phecode", "sex_at_birth_concept_id", "zip", "MaximumAge >= age_in_years", "MinimumAge <= age_in_years"), .(list(NCTId)), by = .EACHI]
+AoU_to_CTgov_wZip_Trial_em$person_id <- person_condition_df_phecode_phenotype_em$person_id
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_em <- AoU_to_CTgov_wZip_Trial_em
+AoU_to_CTgov_wZip_Trial_ReturnOfValue_em <- AoU_to_CTgov_wZip_Trial_ReturnOfValue_em[, c("person_id", "V1", "Phecode")]
+AoU_to_CTgov_wZip_Trial_em <- AoU_to_CTgov_wZip_Trial_em[, .(nMatch = uniqueN(unlist(V1), na.rm = TRUE)), by = .(person_id)]
+write.csv(AoU_to_CTgov_wZip_Trial_em, file = "AoU_to_CTgov_wZip_Trial_em.csv")
+AoU_to_CTgov_wZip_Trial_em <- AoU_to_CTgov_wZip_Trial_em[order(AoU_to_CTgov_wZip_Trial_em$nMatch, decreasing = TRUE), ]
+```
+
+```{r}
+################################################################################
+#                                 2023/12/02 update                            #
+################################################################################
+################################################################################
+#                                   Add SDOH                                   #
+################################################################################
+SDOH_survey <- read.csv("SDOH_survey.csv", header = TRUE)
+person_table1 <- read.csv("person_table1.csv", header = TRUE)
+person_table1 <- as.data.table(person_table1)
+person_figure2 <- read.csv("person_figure2.csv", header = TRUE)
+person_figure2 <- as.data.table(person_figure2)
+
+# 40192526 English proficiency - 1 item (Yes/No)
+# Do you speak a language other than English at home?
+# --- Branching: 40192529 Since you speak a language other than English at home, we are interested in your own thoughts about how well you think you speak English. Would you say you speak English...
+# Not at all, Not well, Well, Very Well
+SDOH_EngProf1 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192526), c("person_id", "answer")]
+SDOH_EngProf1 <- SDOH_EngProf1[-which(SDOH_EngProf1$answer %in% c("PMI: Skip", "PMI: Prefer Not To Answer")), ]
+names(SDOH_EngProf1) <- c("person_id", "EngProf")
+SDOH_EngProf1$EngProf <- ifelse(SDOH_EngProf1$EngProf %in% c("No"), "Yes", "No")
+SDOH_EngProf1 <- SDOH_EngProf1[which(SDOH_EngProf1$EngProf %in% "Yes"), ]
+SDOH_EngProf1$EngProf <- as.factor(SDOH_EngProf1$EngProf)
+SDOH_EngProf1 <- as.data.table(SDOH_EngProf1)
+
+SDOH_EngProf2 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192529), c("person_id", "answer")]
+SDOH_EngProf2 <- SDOH_EngProf2[-which(SDOH_EngProf2$answer %in% c("PMI: Dont Know", "PMI: Skip", "PMI: Prefer Not To Answer")), ]
+names(SDOH_EngProf2) <- c("person_id", "EngProf")
+SDOH_EngProf2$EngProf <- ifelse(SDOH_EngProf2$EngProf %in% c("Well", "Very well"), "Yes", "No")
+SDOH_EngProf <- rbind(SDOH_EngProf1, SDOH_EngProf2)
+SDOH_EngProf$EngProf <- as.factor(SDOH_EngProf$EngProf)
+SDOH_EngProf <- as.data.table(SDOH_EngProf)
+person_table1 <- SDOH_EngProf[person_table1, on = "person_id"]
+person_figure2 <- SDOH_EngProf[person_figure2, on = "person_id"]
+
+# 40192441 Housing instability - 1 item (Number of times moved)
+# In the last 12 months, how many times have you or your family moved from one home to another? Number of moves in past 12 months:'
+SDOH_housing_instability <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192441), c("person_id", "answer")]
+SDOH_housing_instability <- SDOH_housing_instability[-which(SDOH_housing_instability$answer %in% c("PMI: Skip")), ]
+SDOH_housing_instability$answer <- as.numeric(SDOH_housing_instability$answer)
+SDOH_housing_instability$answer <- ifelse(SDOH_housing_instability$answer >= 2, "Yes", "No")
+names(SDOH_housing_instability) <- c("person_id", "HousingInstability")
+SDOH_housing_instability$HousingInstability <- as.factor(SDOH_housing_instability$HousingInstability)
+SDOH_housing_instability <- as.data.table(SDOH_housing_instability)
+person_table1 <- SDOH_housing_instability[person_table1, on = "person_id"]
+# (numerical # of moves)
+SDOH_housing_instability <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192441), c("person_id", "answer")]
+SDOH_housing_instability <- SDOH_housing_instability[-which(SDOH_housing_instability$answer %in% c("PMI: Skip")), ]
+SDOH_housing_instability$answer <- as.numeric(SDOH_housing_instability$answer)
+names(SDOH_housing_instability) <- c("person_id", "HousingInstability")
+SDOH_housing_instability <- as.data.table(SDOH_housing_instability)
+person_figure2 <- SDOH_housing_instability[person_figure2, on = "person_id"]
+
+# Food insecurity - 2 items (Never True, Sometimes True, Often True)
+# 40192517 Within the past 12 months, we worried whether our food would run out before we got money to buy more.
+# 40192426 Within the past 12 months, the food we bought just didn't last and we didn't have money to get more.
+# FI defined as answering Sometimes True/Often True to either of the 2 questions
+# Recoded so that 0 = no FI, 1 = FI (answering Sometimes True or Often True to either of the 2 questions)
+SDOH_food_insecurity1 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192517), c("person_id", "answer")]
+SDOH_food_insecurity1 <- SDOH_food_insecurity1[-which(SDOH_food_insecurity1$answer %in% c("PMI: Skip")), ]
+SDOH_food_insecurity2 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192426), c("person_id", "answer")]
+SDOH_food_insecurity2 <- SDOH_food_insecurity2[-which(SDOH_food_insecurity2$answer %in% c("PMI: Skip")), ]
+SDOH_food_insecurity1 <- as.data.table(SDOH_food_insecurity1)
+SDOH_food_insecurity2 <- as.data.table(SDOH_food_insecurity2)
+SDOH_food_insecurity <- SDOH_food_insecurity2[SDOH_food_insecurity1, on = "person_id"]
+names(SDOH_food_insecurity) <- c("person_id", "answer1", "answer2")
+SDOH_food_insecurity$FI <- ifelse((SDOH_food_insecurity$answer1 %in% c("Never true")) & (SDOH_food_insecurity$answer2 %in% c("Never true")), "No", "Yes")
+SDOH_food_insecurity <- SDOH_food_insecurity[, c("person_id", "FI")]
+SDOH_food_insecurity$FI <- as.factor(SDOH_food_insecurity$FI)
+SDOH_food_insecurity <- as.data.table(SDOH_food_insecurity)
+person_table1 <- SDOH_food_insecurity[person_table1, on = "person_id"]
+person_figure2 <- SDOH_food_insecurity[person_figure2, on = "person_id"]
+
+# Everyday discrimination - 9 items (Almost everyday 5 , At least once a week 4, A few times a month 3, A few times a year 2, Less than once a year 1, Never 0)
+# 40192466 In your day-to-day life, how often are you treated with less courtesy than other people?
+# 40192489 In your day-to-day life, how often are you treated with less respect than other people?
+# 40192416 In your day-to-day life, how often do you receive poorer service than other people at restaurants or stores?
+# 40192490 In your day-to-day life, how often do people act as if they think you are not smart?
+# 40192380 In your day-to-day life, how often do people act as if they are afraid of you?
+# 40192395 In your day-to-day life, how often do people act as if they think you are dishonest?
+# 40192496 In your day-to-day life, how often do people act as if they're better than you are?
+# 40192519 In your day-to-day life, how often are you called names or insulted?
+# 40192451 In your day-to-day life, how often are you threatened or harassed?
+# The scale is flagged as missing if more than two items do not have a valid score
+SDOH_eds1 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192466), c("person_id", "answer")]
+SDOH_eds1 <- SDOH_eds1[-which(SDOH_eds1$answer %in% "PMI: Skip"), ]
+SDOH_eds1$answer <- ifelse(SDOH_eds1$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds1$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds1$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds1$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds1$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds1 <- as.data.table(SDOH_eds1)
+
+SDOH_eds2 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192489), c("person_id", "answer")]
+SDOH_eds2 <- SDOH_eds2[-which(SDOH_eds2$answer %in% "PMI: Skip"), ]
+SDOH_eds2$answer <- ifelse(SDOH_eds2$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds2$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds2$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds2$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds2$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds2 <- as.data.table(SDOH_eds2)
+
+SDOH_eds3 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192416), c("person_id", "answer")]
+SDOH_eds3 <- SDOH_eds3[-which(SDOH_eds3$answer %in% "PMI: Skip"), ]
+SDOH_eds3$answer <- ifelse(SDOH_eds3$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds3$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds3$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds3$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds3$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds3 <- as.data.table(SDOH_eds3)
+
+SDOH_eds4 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192490), c("person_id", "answer")]
+SDOH_eds4 <- SDOH_eds4[-which(SDOH_eds4$answer %in% "PMI: Skip"), ]
+SDOH_eds4$answer <- ifelse(SDOH_eds4$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds4$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds4$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds4$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds4$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds4 <- as.data.table(SDOH_eds4)
+
+SDOH_eds5 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192380), c("person_id", "answer")]
+SDOH_eds5 <- SDOH_eds5[-which(SDOH_eds5$answer %in% "PMI: Skip"), ]
+SDOH_eds5$answer <- ifelse(SDOH_eds5$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds5$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds5$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds5$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds5$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds5 <- as.data.table(SDOH_eds5)
+
+SDOH_eds6 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192395), c("person_id", "answer")]
+SDOH_eds6 <- SDOH_eds6[-which(SDOH_eds6$answer %in% "PMI: Skip"), ]
+SDOH_eds6$answer <- ifelse(SDOH_eds6$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds6$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds6$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds6$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds6$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds6 <- as.data.table(SDOH_eds6)
+
+SDOH_eds7 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192496), c("person_id", "answer")]
+SDOH_eds7 <- SDOH_eds7[-which(SDOH_eds7$answer %in% "PMI: Skip"), ]
+SDOH_eds7$answer <- ifelse(SDOH_eds7$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds7$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds7$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds7$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds7$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds7 <- as.data.table(SDOH_eds7)
+
+SDOH_eds8 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192519), c("person_id", "answer")]
+SDOH_eds8 <- SDOH_eds8[-which(SDOH_eds8$answer %in% "PMI: Skip"), ]
+SDOH_eds8$answer <- ifelse(SDOH_eds8$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds8$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds8$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds8$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds8$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds8 <- as.data.table(SDOH_eds8)
+
+SDOH_eds9 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192451), c("person_id", "answer")]
+SDOH_eds9 <- SDOH_eds9[-which(SDOH_eds9$answer %in% "PMI: Skip"), ]
+SDOH_eds9$answer <- ifelse(SDOH_eds9$answer %in% "Almost everyday", 5,
+                           ifelse(SDOH_eds9$answer %in% "At least once a week", 4, 
+                                  ifelse(SDOH_eds9$answer %in% "A few times a month", 3,
+                                         ifelse(SDOH_eds9$answer %in% "A few times a year", 2, 
+                                                ifelse(SDOH_eds9$answer %in% "Less than once a year", 1, 0)))))
+SDOH_eds9 <- as.data.table(SDOH_eds9)
+
+
+SDOH_eds12 <- SDOH_eds2[SDOH_eds1, on = "person_id"]
+SDOH_eds123 <- SDOH_eds3[SDOH_eds12, on = "person_id"]
+SDOH_eds1234 <- SDOH_eds4[SDOH_eds123, on = "person_id"]
+SDOH_eds12345 <- SDOH_eds5[SDOH_eds1234, on = "person_id"]
+SDOH_eds123456 <- SDOH_eds6[SDOH_eds12345, on = "person_id"]
+SDOH_eds1234567 <- SDOH_eds7[SDOH_eds123456, on = "person_id"]
+SDOH_eds12345678 <- SDOH_eds8[SDOH_eds1234567, on = "person_id"]
+SDOH_eds123456789 <- SDOH_eds9[SDOH_eds12345678, on = "person_id"]
+names(SDOH_eds123456789) <- c("person_id", "answer1", "answer2", "answer3", "answer4", "answer5", "answer6", "answer7", "answer8", "answer9")
+# Define the custom function
+mean_if_at_least_7 <- function(x) {
+  if (sum(!is.na(x)) >= 7) {
+    return(mean(x, na.rm = TRUE))
+  } else {
+    return(NA)
+  }
+}
+
+# Apply the function to each row
+SDOH_eds123456789$answer <- apply(SDOH_eds123456789[, -1], 1, mean_if_at_least_7)
+SDOH_eds <- SDOH_eds123456789[-which(is.na(SDOH_eds123456789$answer)), c("person_id", "answer")]
+names(SDOH_eds) <- c("person_id", "eds")
+SDOH_eds$eds <- ifelse(SDOH_eds$eds > 1, "Yes", "No")
+SDOH_eds$eds <- as.factor(SDOH_eds$eds)
+SDOH_eds <- as.data.table(SDOH_eds)
+person_table1 <- SDOH_eds[person_table1, on = "person_id"]
+# (numerical EDS)
+SDOH_eds12 <- SDOH_eds2[SDOH_eds1, on = "person_id"]
+SDOH_eds123 <- SDOH_eds3[SDOH_eds12, on = "person_id"]
+SDOH_eds1234 <- SDOH_eds4[SDOH_eds123, on = "person_id"]
+SDOH_eds12345 <- SDOH_eds5[SDOH_eds1234, on = "person_id"]
+SDOH_eds123456 <- SDOH_eds6[SDOH_eds12345, on = "person_id"]
+SDOH_eds1234567 <- SDOH_eds7[SDOH_eds123456, on = "person_id"]
+SDOH_eds12345678 <- SDOH_eds8[SDOH_eds1234567, on = "person_id"]
+SDOH_eds123456789 <- SDOH_eds9[SDOH_eds12345678, on = "person_id"]
+names(SDOH_eds123456789) <- c("person_id", "answer1", "answer2", "answer3", "answer4", "answer5", "answer6", "answer7", "answer8", "answer9")
+SDOH_eds123456789$answer <- apply(SDOH_eds123456789[, -1], 1, mean_if_at_least_7)
+SDOH_eds <- SDOH_eds123456789[-which(is.na(SDOH_eds123456789$answer)), c("person_id", "answer")]
+names(SDOH_eds) <- c("person_id", "eds")
+SDOH_eds <- as.data.table(SDOH_eds)
+person_figure2 <- SDOH_eds[person_figure2, on = "person_id"]
+
+# Social support - 8 items (None of the time 1, A little of the time 2, Some of the time 3, Most of the time 4, All of the time 5)
+# 40192442 How often do you have someone to help you if you were confined to bed?
+# 40192480 How often do you have someone to take you to the doctor if you need it?
+# 40192388 How often do you have someone to prepare your meals if you were unable to do it yourself?
+# 40192511 How often do you have someone to help you with daily chores if you were sick?
+# 40192439 How often do you have someone to have a good time with?
+# 40192528 How often do you have someone to turn to for suggestions about how to deal with a personal problem?
+# 40192399 How often do you have someone who understands your problems?
+# 40192446 How often do you have someone to love and make you feel wanted?
+# Compute if 6 or more items have valid responses
+SDOH_ss1 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192442), c("person_id", "answer")]
+SDOH_ss1 <- SDOH_ss1[-which(SDOH_ss1$answer %in% "PMI: Skip"), ]
+SDOH_ss1$answer <- ifelse(SDOH_ss1$answer %in% "None of the time", 1,
+                           ifelse(SDOH_ss1$answer %in% "A little of the time", 2, 
+                                  ifelse(SDOH_ss1$answer %in% "Some of the time", 3,
+                                         ifelse(SDOH_ss1$answer %in% "Most of the time", 4, 5))))
+SDOH_ss1 <- as.data.table(SDOH_ss1)
+
+SDOH_ss2 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192480), c("person_id", "answer")]
+SDOH_ss2 <- SDOH_ss2[-which(SDOH_ss2$answer %in% "PMI: Skip"), ]
+SDOH_ss2$answer <- ifelse(SDOH_ss2$answer %in% "None of the time", 1,
+                           ifelse(SDOH_ss2$answer %in% "A little of the time", 2, 
+                                  ifelse(SDOH_ss2$answer %in% "Some of the time", 3,
+                                         ifelse(SDOH_ss2$answer %in% "Most of the time", 4, 5))))
+SDOH_ss2 <- as.data.table(SDOH_ss2)
+
+SDOH_ss3 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192388), c("person_id", "answer")]
+SDOH_ss3 <- SDOH_ss3[-which(SDOH_ss3$answer %in% "PMI: Skip"), ]
+SDOH_ss3$answer <- ifelse(SDOH_ss3$answer %in% "None of the time", 1,
+                          ifelse(SDOH_ss3$answer %in% "A little of the time", 2, 
+                                 ifelse(SDOH_ss3$answer %in% "Some of the time", 3,
+                                        ifelse(SDOH_ss3$answer %in% "Most of the time", 4, 5))))
+SDOH_ss3 <- as.data.table(SDOH_ss3)
+
+SDOH_ss4 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192511), c("person_id", "answer")]
+SDOH_ss4 <- SDOH_ss4[-which(SDOH_ss4$answer %in% "PMI: Skip"), ]
+SDOH_ss4$answer <- ifelse(SDOH_ss4$answer %in% "None of the time", 1,
+                          ifelse(SDOH_ss4$answer %in% "A little of the time", 2, 
+                                 ifelse(SDOH_ss4$answer %in% "Some of the time", 3,
+                                        ifelse(SDOH_ss4$answer %in% "Most of the time", 4, 5))))
+SDOH_ss4 <- as.data.table(SDOH_ss4)
+
+SDOH_ss5 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192439), c("person_id", "answer")]
+SDOH_ss5 <- SDOH_ss5[-which(SDOH_ss5$answer %in% "PMI: Skip"), ]
+SDOH_ss5$answer <- ifelse(SDOH_ss5$answer %in% "None of the time", 1,
+                          ifelse(SDOH_ss5$answer %in% "A little of the time", 2, 
+                                 ifelse(SDOH_ss5$answer %in% "Some of the time", 3,
+                                        ifelse(SDOH_ss5$answer %in% "Most of the time", 4, 5))))
+SDOH_ss5 <- as.data.table(SDOH_ss5)
+
+SDOH_ss6 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192528), c("person_id", "answer")]
+SDOH_ss6 <- SDOH_ss6[-which(SDOH_ss6$answer %in% "PMI: Skip"), ]
+SDOH_ss6$answer <- ifelse(SDOH_ss6$answer %in% "None of the time", 1,
+                          ifelse(SDOH_ss6$answer %in% "A little of the time", 2, 
+                                 ifelse(SDOH_ss6$answer %in% "Some of the time", 3,
+                                        ifelse(SDOH_ss6$answer %in% "Most of the time", 4, 5))))
+SDOH_ss6 <- as.data.table(SDOH_ss6)
+
+SDOH_ss7 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192399), c("person_id", "answer")]
+SDOH_ss7 <- SDOH_ss7[-which(SDOH_ss7$answer %in% "PMI: Skip"), ]
+SDOH_ss7$answer <- ifelse(SDOH_ss7$answer %in% "None of the time", 1,
+                          ifelse(SDOH_ss7$answer %in% "A little of the time", 2, 
+                                 ifelse(SDOH_ss7$answer %in% "Some of the time", 3,
+                                        ifelse(SDOH_ss7$answer %in% "Most of the time", 4, 5))))
+SDOH_ss7 <- as.data.table(SDOH_ss7)
+
+SDOH_ss8 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192446), c("person_id", "answer")]
+SDOH_ss8 <- SDOH_ss8[-which(SDOH_ss8$answer %in% "PMI: Skip"), ]
+SDOH_ss8$answer <- ifelse(SDOH_ss8$answer %in% "None of the time", 1,
+                          ifelse(SDOH_ss8$answer %in% "A little of the time", 2, 
+                                 ifelse(SDOH_ss8$answer %in% "Some of the time", 3,
+                                        ifelse(SDOH_ss8$answer %in% "Most of the time", 4, 5))))
+SDOH_ss8 <- as.data.table(SDOH_ss8)
+
+SDOH_ss12 <- SDOH_ss2[SDOH_ss1, on = "person_id"]
+SDOH_ss123 <- SDOH_ss3[SDOH_ss12, on = "person_id"]
+SDOH_ss1234 <- SDOH_ss4[SDOH_ss123, on = "person_id"]
+SDOH_ss12345 <- SDOH_ss5[SDOH_ss1234, on = "person_id"]
+SDOH_ss123456 <- SDOH_ss6[SDOH_ss12345, on = "person_id"]
+SDOH_ss1234567 <- SDOH_ss7[SDOH_ss123456, on = "person_id"]
+SDOH_ss12345678 <- SDOH_ss8[SDOH_ss1234567, on = "person_id"]
+names(SDOH_ss12345678) <- c("person_id", "answer1", "answer2", "answer3", "answer4", "answer5", "answer6", "answer7", "answer8")
+# Define the custom function
+mean_if_at_least_6 <- function(x) {
+  if (sum(!is.na(x)) >= 6) {
+    return(mean(x, na.rm = TRUE))
+  } else {
+    return(NA)
+  }
+}
+
+# Apply the function to each row
+SDOH_ss12345678$answer <- apply(SDOH_ss12345678[, -1], 1, mean_if_at_least_6)
+SDOH_ss <- SDOH_ss12345678[-which(is.na(SDOH_ss12345678$answer)), c("person_id", "answer")]
+names(SDOH_ss) <- c("person_id", "ss")
+SDOH_ss$ss <- ifelse(SDOH_ss$ss > 2, "Yes", "No")
+SDOH_ss$ss <- as.factor(SDOH_ss$ss)
+SDOH_ss <- as.data.table(SDOH_ss)
+person_table1 <- SDOH_ss[person_table1, on = "person_id"]
+# (numerical ss)
+SDOH_ss12 <- SDOH_ss2[SDOH_ss1, on = "person_id"]
+SDOH_ss123 <- SDOH_ss3[SDOH_ss12, on = "person_id"]
+SDOH_ss1234 <- SDOH_ss4[SDOH_ss123, on = "person_id"]
+SDOH_ss12345 <- SDOH_ss5[SDOH_ss1234, on = "person_id"]
+SDOH_ss123456 <- SDOH_ss6[SDOH_ss12345, on = "person_id"]
+SDOH_ss1234567 <- SDOH_ss7[SDOH_ss123456, on = "person_id"]
+SDOH_ss12345678 <- SDOH_ss8[SDOH_ss1234567, on = "person_id"]
+names(SDOH_ss12345678) <- c("person_id", "answer1", "answer2", "answer3", "answer4", "answer5", "answer6", "answer7", "answer8")
+# Apply the function to each row
+SDOH_ss12345678$answer <- apply(SDOH_ss12345678[, -1], 1, mean_if_at_least_6)
+SDOH_ss <- SDOH_ss12345678[-which(is.na(SDOH_ss12345678$answer)), c("person_id", "answer")]
+names(SDOH_ss) <- c("person_id", "ss")
+SDOH_ss <- as.data.table(SDOH_ss)
+person_figure2 <- SDOH_ss[person_figure2, on = "person_id"]
+
+# Housing quality - 1 item (Bug infestation, Mold, Lead paint or pipes, inadequate heat, oven or stove not working, no or not working smoke detector, water leaks, non oe fthe above)
+# 40192402 Think about the place you live. Do you have problems with any of the following? Select all that apply. 
+SDOH_hq <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192402), c("person_id", "answer")]
+SDOH_hq <- SDOH_hq[-which(SDOH_hq$answer %in% "PMI: Skip"), ]
+SDOH_hq$answer <- ifelse(SDOH_hq$answer %in% "None of the above", "No", "Yes")
+SDOH_hq <- SDOH_hq %>% distinct()
+SDOH_hq$answer <- as.factor(SDOH_hq$answer)
+names(SDOH_hq) <- c("person_id", "hq")
+SDOH_hq <- as.data.table(SDOH_hq)
+person_table1 <- SDOH_hq[person_table1, on = "person_id"]
+person_figure2 <- SDOH_hq[person_figure2, on = "person_id"]
+
+# Social cohesion neighborhood - 4 items (Strongly agree 1, Agree 2, Neutral 3, Disagree 4, Strongly disagree 5)
+# 40192463 How much you agree or disagree that people around here are willing to help their neighbor?
+# 40192411 How much you agree or disagree that people in your neighborhood generally get along with each other?
+# 40192499 How much you agree or disagree that people in your neighborhood can be trusted?
+# 40192417 How much you agree or disagree that people in your neighborhood share the same values?
+# Caculate as missing if any of the 4 items is missing
+SDOH_scns1 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192463), c("person_id", "answer")]
+SDOH_scns1 <- SDOH_scns1[-which(SDOH_scns1$answer %in% "PMI: Skip"), ]
+SDOH_scns1$answer <- ifelse(SDOH_scns1$answer %in% "Strongly agree", 1,
+                           ifelse(SDOH_scns1$answer %in% "Agree", 2, 
+                                  ifelse(SDOH_scns1$answer %in% "Neutral (neither agree nor disagree)", 3,
+                                         ifelse(SDOH_scns1$answer %in% "Disagree", 4, 5))))
+SDOH_scns1 <- as.data.table(SDOH_scns1)
+
+SDOH_scns2 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192411), c("person_id", "answer")]
+SDOH_scns2 <- SDOH_scns2[-which(SDOH_scns2$answer %in% "PMI: Skip"), ]
+SDOH_scns2$answer <- ifelse(SDOH_scns2$answer %in% "Strongly agree", 1,
+                            ifelse(SDOH_scns2$answer %in% "Agree", 2, 
+                                   ifelse(SDOH_scns2$answer %in% "Neutral (neither agree nor disagree)", 3,
+                                          ifelse(SDOH_scns2$answer %in% "Disagree", 4, 5))))
+SDOH_scns2 <- as.data.table(SDOH_scns2)
+
+SDOH_scns3 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192499), c("person_id", "answer")]
+SDOH_scns3 <- SDOH_scns3[-which(SDOH_scns3$answer %in% "PMI: Skip"), ]
+SDOH_scns3$answer <- ifelse(SDOH_scns3$answer %in% "Strongly agree", 1,
+                            ifelse(SDOH_scns3$answer %in% "Agree", 2, 
+                                   ifelse(SDOH_scns3$answer %in% "Neutral (neither agree nor disagree)", 3,
+                                          ifelse(SDOH_scns3$answer %in% "Disagree", 4, 5))))
+SDOH_scns3 <- as.data.table(SDOH_scns3)
+
+SDOH_scns4 <- SDOH_survey[which(SDOH_survey$question_concept_id == 40192417), c("person_id", "answer")]
+SDOH_scns4 <- SDOH_scns4[-which(SDOH_scns4$answer %in% "PMI: Skip"), ]
+SDOH_scns4$answer <- ifelse(SDOH_scns4$answer %in% "Strongly agree", 1,
+                            ifelse(SDOH_scns4$answer %in% "Agree", 2, 
+                                   ifelse(SDOH_scns4$answer %in% "Neutral (neither agree nor disagree)", 3,
+                                          ifelse(SDOH_scns4$answer %in% "Disagree", 4, 5))))
+SDOH_scns4 <- as.data.table(SDOH_scns4)
+
+SDOH_scns12 <- SDOH_scns2[SDOH_scns1, on = "person_id"]
+SDOH_scns123 <- SDOH_scns3[SDOH_scns12, on = "person_id"]
+SDOH_scns1234 <- SDOH_scns4[SDOH_scns123, on = "person_id"]
+names(SDOH_scns1234) <- c("person_id", "answer1", "answer2", "answer3", "answer4")
+SDOH_scns1234$answer <- SDOH_scns1234$answer1 + SDOH_scns1234$answer2 + SDOH_scns1234$answer3 + SDOH_scns1234$answer4 
+SDOH_scns <- SDOH_scns1234[-which(is.na(SDOH_scns1234$answer)), c("person_id", "answer")]
+SDOH_scns$answer <- SDOH_scns$answer/4
+names(SDOH_scns) <- c("person_id", "scns")
+SDOH_scns$scns <- ifelse(SDOH_scns$scns > 3, "Yes", "No")
+SDOH_scns$scns <- as.factor(SDOH_scns$scns)
+SDOH_scns <- as.data.table(SDOH_scns)
+person_table1 <- SDOH_scns[person_table1, on = "person_id"]
+# (numerical ps)
+SDOH_scns12 <- SDOH_scns2[SDOH_scns1, on = "person_id"]
+SDOH_scns123 <- SDOH_scns3[SDOH_scns12, on = "person_id"]
+SDOH_scns1234 <- SDOH_scns4[SDOH_scns123, on = "person_id"]
+names(SDOH_scns1234) <- c("person_id", "answer1", "answer2", "answer3", "answer4")
+SDOH_scns1234$answer <- SDOH_scns1234$answer1 + SDOH_scns1234$answer2 + SDOH_scns1234$answer3 + SDOH_scns1234$answer4 
+SDOH_scns <- SDOH_scns1234[-which(is.na(SDOH_scns1234$answer)), c("person_id", "answer")]
+SDOH_scns$answer <- SDOH_scns$answer/4
+names(SDOH_scns) <- c("person_id", "scns")
+SDOH_scns <- as.data.table(SDOH_scns)
+person_figure2 <- SDOH_scns[person_figure2, on = "person_id"]
+```
+
+```{r}
+################################################################################
+#                                 2023/09/20 update                            #
+################################################################################
+
+Figure1_fun <- function(data){
+  options(digits = 10)
+  data_Table1 <- data
+  data_Table1_merge <- person_table1[data_Table1, on = "person_id"]
+    
+  # Age
+  ageCat1_data <- data_Table1_merge[which(data_Table1_merge$age_cat == 1),]
+  mod_ageCat1 <- lm(ageCat1_data$nMatch ~ 1)
+  ageCat1 <- c(coefficients(mod_ageCat1)[[1]], confint(mod_ageCat1)[[1]], confint(mod_ageCat1)[[2]])
+  ageCat2_data <- data_Table1_merge[which(data_Table1_merge$age_cat == 2),]
+  mod_ageCat2 <- lm(ageCat2_data$nMatch ~ 1)
+  ageCat2 <- c(coefficients(mod_ageCat2)[[1]], confint(mod_ageCat2)[[1]], confint(mod_ageCat2)[[2]])
+
+  # Sex
+  female_data <- data_Table1_merge[which(data_Table1_merge$sex_at_birth %in% "Female"),]
+  mod_female <- lm(female_data$nMatch ~ 1)
+  female <- c(coefficients(mod_female)[[1]], confint(mod_female)[[1]], confint(mod_female)[[2]])
+  male_data <- data_Table1_merge[which(data_Table1_merge$sex_at_birth %in% "Male"),]
+  mod_male <- lm(male_data$nMatch ~ 1)
+  male <- c(coefficients(mod_male)[[1]], confint(mod_male)[[1]], confint(mod_male)[[2]])
+  intersex_data <- data_Table1_merge[which(data_Table1_merge$sex_at_birth %in% "Intersex"),]
+  mod_intersex <- lm(intersex_data$nMatch ~ 1)
+  intersex <- c(coefficients(mod_intersex)[[1]], confint(mod_intersex)[[1]], confint(mod_intersex)[[2]])
+
+  # R/E
+  White_data <- data_Table1_merge[which(data_Table1_merge$race_ethnicity %in% "White"),]
+  mod_White <- lm(White_data$nMatch ~ 1)
+  White <- c(coefficients(mod_White)[[1]], confint(mod_White)[[1]], confint(mod_White)[[2]])
+  Black_data <- data_Table1_merge[which(data_Table1_merge$race_ethnicity %in% "Black"),]
+  mod_Black <- lm(Black_data$nMatch ~ 1)
+  Black <- c(coefficients(mod_Black)[[1]], confint(mod_Black)[[1]], confint(mod_Black)[[2]])
+  Hispanic_data <- data_Table1_merge[which(data_Table1_merge$race_ethnicity %in% "Hispanic"),]
+  mod_Hispanic <- lm(Hispanic_data$nMatch ~ 1)
+  Hispanic <- c(coefficients(mod_Hispanic)[[1]], confint(mod_Hispanic)[[1]], confint(mod_Hispanic)[[2]])
+  Asian_data <- data_Table1_merge[which(data_Table1_merge$race_ethnicity %in% "Asian"),]
+  mod_Asian <- lm(Asian_data$nMatch ~ 1)
+  Asian <- c(coefficients(mod_Asian)[[1]], confint(mod_Asian)[[1]], confint(mod_Asian)[[2]])
+  MENA_data <- data_Table1_merge[which(data_Table1_merge$race_ethnicity %in% "MENA"),]
+  mod_MENA <- lm(MENA_data$nMatch ~ 1)
+  MENA <- c(coefficients(mod_MENA)[[1]], confint(mod_MENA)[[1]], confint(mod_MENA)[[2]])
+  NHOPI_data <- data_Table1_merge[which(data_Table1_merge$race_ethnicity %in% "NHOPI"),]
+  mod_NHOPI <- lm(NHOPI_data$nMatch ~ 1)
+  NHOPI <- c(coefficients(mod_NHOPI)[[1]], confint(mod_NHOPI)[[1]], confint(mod_NHOPI)[[2]])
+  Multiple_data <- data_Table1_merge[which(data_Table1_merge$race_ethnicity %in% "Multiple"),]
+  mod_Multiple <- lm(Multiple_data$nMatch ~ 1)
+  Multiple <- c(coefficients(mod_Multiple)[[1]], confint(mod_Multiple)[[1]], confint(mod_Multiple)[[2]])
+  Other_data <- data_Table1_merge[which(data_Table1_merge$race_ethnicity %in% "Other"),]
+  mod_Other <- lm(Other_data$nMatch ~ 1)
+  Other <- c(coefficients(mod_Other)[[1]], confint(mod_Other)[[1]], confint(mod_Other)[[2]])
+ 
+  # Education
+  Eleven_below_data <- data_Table1_merge[which(data_Table1_merge$education %in% c("Eleven or below")), ]
+  mod_Eleven_below <- lm(Eleven_below_data$nMatch ~ 1)
+  Eleven_below <- c(coefficients(mod_Eleven_below)[[1]], confint(mod_Eleven_below)[[1]], confint(mod_Eleven_below)[[2]])
+
+  Twelve_GED_data <- data_Table1_merge[which(data_Table1_merge$education %in% c("Twelve or GED")), ]
+  mod_Twelve_GED <- lm(Twelve_GED_data$nMatch ~ 1)
+  Twelve_GED <- c(coefficients(mod_Twelve_GED)[[1]], confint(mod_Twelve_GED)[[1]], confint(mod_Twelve_GED)[[2]])
+
+  College_graduate_data <- data_Table1_merge[which(data_Table1_merge$education %in% c("College Graduate")), ]
+  mod_College_graduate <- lm(College_graduate_data$nMatch ~ 1)
+  College_graduate <- c(coefficients(mod_College_graduate)[[1]], confint(mod_College_graduate)[[1]], confint(mod_College_graduate)[[2]])
+
+  Advanced_degree_data <- data_Table1_merge[which(data_Table1_merge$education %in% c("Advanced Degree")), ]
+  mod_Advanced_degree <- lm(Advanced_degree_data$nMatch ~ 1)
+  Advanced_degree <- c(coefficients(mod_Advanced_degree)[[1]], confint(mod_Advanced_degree)[[1]], confint(mod_Advanced_degree)[[2]])
+    
+  # Location
+  Metro_data <- data_Table1_merge[which(data_Table1_merge$location %in% "Metro"),]
+  mod_Metro <- lm(Metro_data$nMatch ~ 1)
+  Metro <- c(coefficients(mod_Metro)[[1]], confint(mod_Metro)[[1]], confint(mod_Metro)[[2]])
+  NonMetro_data <- data_Table1_merge[which(data_Table1_merge$location %in% "NonMetro"),]
+  mod_NonMetro <- lm(NonMetro_data$nMatch ~ 1)
+  NonMetro <- c(coefficients(mod_NonMetro)[[1]], confint(mod_NonMetro)[[1]], confint(mod_NonMetro)[[2]])
+
+  # Income
+  low_income_data_yes <- data_Table1_merge[which(data_Table1_merge$low_income %in% "Yes"),]
+  mod_low_income_yes <- lm(low_income_data_yes$nMatch ~ 1)
+  low_income_yes <- c(coefficients(mod_low_income_yes)[[1]], confint(mod_low_income_yes)[[1]], confint(mod_low_income_yes)[[2]])
+
+  low_income_data_no <- data_Table1_merge[which(data_Table1_merge$low_income %in% "No"),]
+  mod_low_income_no <- lm(low_income_data_no$nMatch ~ 1)
+  low_income_no <- c(coefficients(mod_low_income_no)[[1]], confint(mod_low_income_no)[[1]], confint(mod_low_income_no)[[2]])
+    
+ # Disability
+  disability_data_yes <- data_Table1_merge[which(data_Table1_merge$any_disability %in% "Yes"),]
+  mod_disability_yes <- lm(disability_data_yes$nMatch ~ 1)
+  disability_yes <- c(coefficients(mod_disability_yes)[[1]], confint(mod_disability_yes)[[1]], confint(mod_disability_yes)[[2]])
+
+  disability_data_no <- data_Table1_merge[which(data_Table1_merge$any_disability %in% "No"),]
+  mod_disability_no <- lm(disability_data_no$nMatch ~ 1)
+  disability_no <- c(coefficients(mod_disability_no)[[1]], confint(mod_disability_no)[[1]], confint(mod_disability_no)[[2]])
+
+  # English proficiency
+  EngProf_data_yes <- data_Table1_merge[which(data_Table1_merge$EngProf %in% "Yes"),]
+  mod_EngProf_yes <- lm(EngProf_data_yes$nMatch ~ 1)
+  EngProf_yes <- c(coefficients(mod_EngProf_yes)[[1]], confint(mod_EngProf_yes)[[1]], confint(mod_EngProf_yes)[[2]])
+
+  EngProf_data_no <- data_Table1_merge[which(data_Table1_merge$EngProf %in% "No"),]
+  mod_EngProf_no <- lm(EngProf_data_no$nMatch ~ 1)
+  EngProf_no <- c(coefficients(mod_EngProf_no)[[1]], confint(mod_EngProf_no)[[1]], confint(mod_EngProf_no)[[2]])  
+  
+  # Food insecurity
+  FI_data_yes <- data_Table1_merge[which(data_Table1_merge$FI %in% "Yes"),]
+  mod_FI_yes <- lm(FI_data_yes$nMatch ~ 1)
+  FI_yes <- c(coefficients(mod_FI_yes)[[1]], confint(mod_FI_yes)[[1]], confint(mod_FI_yes)[[2]])
+    
+  FI_data_no <- data_Table1_merge[which(data_Table1_merge$FI %in% "No"),]
+  mod_FI_no <- lm(FI_data_no$nMatch ~ 1)
+  FI_no <- c(coefficients(mod_FI_no)[[1]], confint(mod_FI_no)[[1]], confint(mod_FI_no)[[2]])
+    
+  # Housing instability
+  HI_data_yes <- data_Table1_merge[which(data_Table1_merge$HousingInstability %in% "Yes"), ]
+  mod_HI_yes <- lm(HI_data_yes$nMatch ~ 1)
+  HI_yes <- c(coefficients(mod_HI_yes)[[1]], confint(mod_HI_yes)[[1]], confint(mod_HI_yes)[[2]])
+    
+  HI_data_no <- data_Table1_merge[which(data_Table1_merge$HousingInstability %in% "No"), ]
+  mod_HI_no <- lm(HI_data_no$nMatch ~ 1)
+  HI_no <- c(coefficients(mod_HI_no)[[1]], confint(mod_HI_no)[[1]], confint(mod_HI_no)[[2]])
+    
+  # Everyday discrimination
+  eds_data_yes <- data_Table1_merge[which(data_Table1_merge$eds %in% "Yes"), ]
+  mod_eds_yes <- lm(eds_data_yes$nMatch ~ 1)
+  eds_yes <- c(coefficients(mod_eds_yes)[[1]], confint(mod_eds_yes)[[1]], confint(mod_eds_yes)[[2]])
+
+  eds_data_no <- data_Table1_merge[which(data_Table1_merge$eds %in% "No"), ]
+  mod_eds_no <- lm(eds_data_no$nMatch ~ 1)
+  eds_no <- c(coefficients(mod_eds_no)[[1]], confint(mod_eds_no)[[1]], confint(mod_eds_no)[[2]])
+
+  # Social support
+  ss_data_yes <- data_Table1_merge[which(data_Table1_merge$ss %in% "Yes"), ]
+  mod_ss_yes <- lm(ss_data_yes$nMatch ~ 1)
+  ss_yes <- c(coefficients(mod_ss_yes)[[1]], confint(mod_ss_yes)[[1]], confint(mod_ss_yes)[[2]])
+
+  ss_data_no <- data_Table1_merge[which(data_Table1_merge$ss %in% "No"), ]
+  mod_ss_no <- lm(ss_data_no$nMatch ~ 1)
+  ss_no <- c(coefficients(mod_ss_no)[[1]], confint(mod_ss_no)[[1]], confint(mod_ss_no)[[2]])
+    
+  # Neighborhood disorder
+  hq_data_yes <- data_Table1_merge[which(data_Table1_merge$hq %in% "Yes"), ]
+  mod_hq_yes <- lm(hq_data_yes$nMatch ~ 1)
+  hq_yes <- c(coefficients(mod_hq_yes)[[1]], confint(mod_hq_yes)[[1]], confint(mod_hq_yes)[[2]])
+
+  hq_data_no <- data_Table1_merge[which(data_Table1_merge$hq %in% "No"), ]
+  mod_hq_no <- lm(hq_data_no$nMatch ~ 1)
+  hq_no <- c(coefficients(mod_hq_no)[[1]], confint(mod_hq_no)[[1]], confint(mod_hq_no)[[2]])
+  
+  # Social cohesion neighborhood
+  scns_data_yes <- data_Table1_merge[which(data_Table1_merge$scns %in% "Yes"), ]
+  mod_scns_yes <- lm(scns_data_yes$nMatch ~ 1)
+  scns_yes <- c(coefficients(mod_scns_yes)[[1]], confint(mod_scns_yes)[[1]], confint(mod_scns_yes)[[2]])
+  
+  scns_data_no <- data_Table1_merge[which(data_Table1_merge$scns %in% "No"), ]
+  mod_scns_no <- lm(scns_data_no$nMatch ~ 1)
+  scns_no <- c(coefficients(mod_scns_no)[[1]], confint(mod_scns_no)[[1]], confint(mod_scns_no)[[2]])
+
+return(data.frame(ageCat1, ageCat2, male, female, intersex, White, Black, Hispanic, Asian, MENA, 
+                  NHOPI, Multiple, Other, Metro, NonMetro, EngProf_yes, EngProf_no, FI_yes, FI_no,
+                  HI_yes, HI_no, low_income_yes, low_income_no, eds_yes, eds_no, ss_yes, ss_no,
+                  Eleven_below, Twelve_GED, College_graduate, Advanced_degree, hq_yes, hq_no, scns_yes, scns_no,
+                 disability_yes, disability_no))
+}
+
+
+# other_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_other)
+other_Figure1 <- Figure1_fun(data = AoU_to_CTgov_wZip_Trial_other)
+other_Fig1 <- as.data.frame(t(other_Figure1))
+
+# respiratory_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_respiratory)
+respiratory_Figure1 <- Figure1_fun(data = AoU_to_CTgov_wZip_Trial_respiratory)
+respiratory_Fig1 <- as.data.frame(t(respiratory_Figure1))
+
+# circulatory_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_circulatory)
+circulatory_Figure1 <- Figure1_fun(data = AoU_to_CTgov_wZip_Trial_circulatory)
+circulatory_Fig1 <- as.data.frame(t(circulatory_Figure1))
+
+# neurological_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_neurological)
+neurological_Figure1 <- Figure1_fun(data = AoU_to_CTgov_wZip_Trial_neurological)
+neurological_Fig1 <- as.data.frame(t(neurological_Figure1))
+
+# em_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_em)
+em_Figure1 <- Figure1_fun(data = AoU_to_CTgov_wZip_Trial_em)
+em_Fig1 <- as.data.frame(t(em_Figure1))
+
+# mental_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_mental)
+mental_Figure1 <- Figure1_fun(data = AoU_to_CTgov_wZip_Trial_mental)
+mental_Fig1 <- as.data.frame(t(mental_Figure1))
+
+# neoplasms_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_neoplasms)
+neoplasms_Figure1 <- Figure1_fun(data = AoU_to_CTgov_wZip_Trial_neoplasms)
+neoplasms_Fig1 <- as.data.frame(t(neoplasms_Figure1))
+
+# overall_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_overall)
+overall_Figure1 <- Figure1_fun(data = AoU_to_CTgov_wZip_Trial_overall)
+Overall_Fig1 <- as.data.frame(t(overall_Figure1))
+
+# Overall avg and 95% CI
+data_Table1 <- fread("AoU_to_CTgov_wZip_Trial.csv", header = TRUE)
+data_Table1_merge <- person_table1[data_Table1, on = "person_id"]
+mod_Overall <- lm(data_Table1_merge$nMatch ~ 1)
+Overall <- c(coefficients(mod_Overall)[[1]], confint(mod_Overall)[[1]], confint(mod_Overall)[[2]]) 
+
+# RE minorities only
+RE_data_Table1_merge <- data_Table1_merge[!which(data_Table1_merge$race_ethnicity %in% "White"), ]
+mod_RE_minorities <- lm(RE_data_Table1_merge$nMatch ~ 1)
+RE_minorities <- c(coefficients(mod_RE_minorities)[[1]], confint(mod_RE_minorities)[[1]], confint(mod_RE_minorities)[[2]]) 
+```
+
+```{r}
+################################################################################
+#                                 2023/12/02 update                            #
+################################################################################
+################################################################################
+#                                    Figure 5                                  #
+################################################################################
+person_figure2$low_income <- factor(person_figure2$low_income, levels = c("No", "Yes"))
+# person_figure2$max_income <- factor(person_figure2$max_income, levels = c("9999", "25000", "35000", "50000", "75000", "100000", "150000", "200000", "200001"))
+person_figure2$EngProf <- factor(person_figure2$EngProf, levels = c("No", "Yes"))
+person_figure2$education <- factor(person_figure2$education, levels = c("Eleven or below", "Twelve or GED", "College Graduate", "Advanced Degree"))
+#person_figure2$education <- ifelse(person_figure2$education %in% "Eleven or below", "Eleven or below", "Twelve or above")
+#person_figure2$education <- factor(person_figure2$education, levels = c("Eleven or below", "Twelve or above"))
+person_figure2$location <- factor(person_figure2$location, levels = c("Metro", "NonMetro"))
+person_figure2$race_ethnicity <- factor(person_figure2$race_ethnicity, levels = c("White", "Black", "Hispanic", "Asian", "MENA", "NHOPI", "Multiple", "Other"))
+person_figure2$sex_at_birth <- factor(person_figure2$sex_at_birth, levels = c("Female", "Male", "Intersex"))
+
+# eds - Higher = worse
+# ss - Lower = better
+# scns - Higher = worse
+# Housing instability - Higher = worse
+Figure2_fun <- function(data, data_nCond){
+  data_Table1 <- data
+  data_Table1_merge <- person_figure2[data_Table1, on = "person_id"]
+  data_Table1_merge2 <- data_nCond[data_Table1_merge, on = "person_id"]
+  mod <- glm.nb(nMatch ~ n_condition + sex_at_birth + age_in_years + location + race_ethnicity + education + low_income + scns + ss + hq + EngProf + eds + FI, data = data_Table1_merge2)
+  # return(data.frame(coef = coefficients(mod), confint(mod), pval = coef(summary(mod))[, 4]))
+  return(summary(mod))
+}
+
+Figure2_neoplasms <- Figure2_fun(data = AoU_to_CTgov_wZip_Trial_neoplasms, person_nCond_neoplasms)
+# Figure2_neoplasms
+write.csv(Figure2_neoplasms, file = "Figure2_neoplasms.csv")
+Figure2_em <- Figure2_fun(data = AoU_to_CTgov_wZip_Trial_em, person_nCond_em)
+# Figure2_em
+write.csv(Figure2_em, file = "Figure2_em.csv")
+Figure2_circulatory <- Figure2_fun(data = AoU_to_CTgov_wZip_Trial_circulatory, person_nCond_circulatory)
+# Figure2_circulatory
+write.csv(Figure2_circulatory, file = "Figure2_circulatory.csv")
+Figure2_respiratory <- Figure2_fun(data = AoU_to_CTgov_wZip_Trial_respiratory, person_nCond_respiratory)
+# Figure2_respiratory
+write.csv(Figure2_respiratory, file = "Figure2_respiratory.csv")
+Figure2_mental <- Figure2_fun(data = AoU_to_CTgov_wZip_Trial_mental, person_nCond_mental)
+# Figure2_respiratory
+write.csv(Figure2_mental, file = "Figure2_mental.csv")
+Figure2_other <- Figure2_fun(data = AoU_to_CTgov_wZip_Trial_other, person_nCond_other)
+# Figure2_other
+write.csv(Figure2_other, file = "Figure2_other.csv")
+Figure2_neurological <- Figure2_fun(data = AoU_to_CTgov_wZip_Trial_neurological, person_nCond_neurological)
+# Figure2_neurological
+write.csv(Figure2_neurological, file = "Figure2_neurological.csv")
+```
+
 
 ```{r}
 ####################################################################################################
@@ -847,9 +1909,9 @@ infectious_Table1 <- Table1_fun(data = AoU_to_CTgov_wZip_Trial_infectious)
 t(infectious_Table1)
 ```
 
-```{r, Figure 1}
+```{r, Figure 3}
 ####################################################################################################
-#                                        Figure 1 TOC NIH                                          #
+#                                        Figure 3 TOC NIH                                          #
 ####################################################################################################
 
 counts_wZip_Trial_NIH <- fread("counts_wZip_Trial_NIH.csv", header = TRUE)
@@ -1125,7 +2187,7 @@ quantile_label_counts_plot %>% layout(annotations = list(text = "Many Participan
 ), opacity = 0.2, showarrow = FALSE))
 ```
 
-```{r, PheWAS Helper Functions}
+```{r, PheWAS Helper Functions for Figure 4}
 ##############################################################################################
 #                                  PheWAS Helper Functions                                   #
 #                                                                                            #
